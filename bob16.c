@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define MEM_WORDS 0x10000
 
@@ -55,6 +56,9 @@ enum { FEAT_MEMOPS = 1 << 0,   /* [reg] memory operands on ALU instructions */
        FEAT_IO     = 1 << 3,   /* in / out */
        FEAT_STACK  = 1 << 4 }; /* push / pop / call / ret */
 
+enum { PORTF_IO   = 1 << 0,
+       PORTF_TIME = 1 << 1 };
+
 #define BOB16_VERSION 0x0100   /* 1.0 */
 
 static struct {
@@ -67,6 +71,8 @@ static struct {
 
 static word mem[MEM_WORDS];
 static bool running = true;
+static int64_t virtual_time;
+static int64_t actual_time;
 
 /* sign-extend the low `bits` bits of val */
 static int sext(word val, int bits) {
@@ -109,6 +115,15 @@ static void load_program(const char *path) {
     for (size_t i = 0; i < n / 2; i++) {
         mem[i] = (word)(buf[2 * i] | (buf[2 * i + 1] << 8));
     }
+}
+
+static int64_t gettime(void) {
+    return virtual_time + ((int64_t)time(NULL) - actual_time);
+}
+
+static void settime(int64_t t) {
+    virtual_time = t;
+    actual_time = time(NULL);
 }
 
 static void step1(void) {
@@ -313,6 +328,8 @@ static void step2(void) {
     word at2 = at1 + 1;
     word opc = (mem[at0] >> 8) & 0xFF;
 
+    int64_t timet;
+
     cpu.ir = mem[at0];
     if (i3) {
         /* i3 = third word holds a 16-bit immediate; only some ops take it */
@@ -451,6 +468,18 @@ static void step2(void) {
             cpu.r[dr] = (word)getchar();
             if (icc) set_cc(cpu.r[dr]);
             break;
+        case 0x70:
+            cpu.r[dr] = (word)(gettime() & 0xFFFF);
+            break;
+        case 0x71:
+            cpu.r[dr] = (word)((gettime() >> 16) & 0xFFFF);
+            break;
+        case 0x72:
+            cpu.r[dr] = (word)((gettime() >> 32) & 0xFFFF);
+            break;
+        case 0x73:
+            cpu.r[dr] = (word)((gettime() >> 48) & 0xFFFF);
+            break;
         default:
             bad(at0);
         }
@@ -461,6 +490,30 @@ static void step2(void) {
         switch (cpu.r[dr]) {
         case 0x0:
             putchar((char)or1v);
+            break;
+        case 0x70:
+            timet = gettime();
+            timet = timet & 0xFFFFFFFFFFFF0000;
+            timet = timet + or1v;
+            settime(timet);
+            break;
+        case 0x71:
+            timet = gettime();
+            timet = timet & 0xFFFFFFFF0000FFFF;
+            timet = timet + ((int64_t)or1v << 16);
+            settime(timet);
+            break;
+        case 0x72:
+            timet = gettime();
+            timet = timet & 0xFFFF0000FFFFFFFF;
+            timet = timet + ((int64_t)or1v << 32);
+            settime(timet);
+            break;
+        case 0x73:
+            timet = gettime();
+            timet = timet & 0x0000FFFFFFFFFFFF;
+            timet = timet + ((int64_t)or1v << 48);
+            settime(timet);
             break;
         default:
             bad(at0);
@@ -515,7 +568,7 @@ static void step2(void) {
         case ID_RS0:      v = cpu.rs0; break;
         case ID_REGS:     v = (8 << 8) | 16; break;
         case ID_OPCODES:  v = I2_SMOD + 1; break;
-        case ID_PORTS:    v = 0x1; break;               /* port 0 = console */
+        case ID_PORTS:    v = PORTF_IO | PORTF_TIME; break;
         case ID_NAME0:    v = ('B' << 8) | 'O'; break;
         case ID_NAME1:    v = ('B' << 8) | '-'; break;
         case ID_NAME2:    v = ('1' << 8) | '6'; break;
@@ -633,6 +686,9 @@ int main(int argc, char **argv) {
     load_program(argv[1]);
 
     cpu.rs0 = 0;
+    int64_t t = (int64_t)time(NULL);
+    virtual_time = t;
+    actual_time = t;
     while (running) {
         step();
     }
