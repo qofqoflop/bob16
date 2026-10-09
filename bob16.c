@@ -256,6 +256,16 @@ static void step1(void) {
     }
 }
 
+#define alu_pre word r, a, b; \
+                a = cpu.r[or1]; \
+                b = i2 ? or2 : cpu.r[or2]; \
+                if (imem1) a = mem[a]; \
+                if (imem2) b = mem[b]
+
+#define alu_post if (icc) set_cc(r); \
+                 if (imemd) mem[cpu.r[dr]] = r; \
+                 else cpu.r[dr] = r
+
 static void step2(void) {
     word at0 = cpu.pc;
     word at1 = at0 + 1;
@@ -263,6 +273,9 @@ static void step2(void) {
 
     word icc = (mem[at0] >> 7) & 0x1;
     word i2 = (mem[at0] >> 6) & 0x1;
+    word imemd = (mem[at0] >> 5) & 0x1;
+    word imem1 = (mem[at0] >> 4) & 0x1;
+    word imem2 = (mem[at0] >> 3) & 0x1;
 
     word dr = (mem[at1] >> 12) & 0xF;
     word or1 = (mem[at1] >> 8) & 0xF;
@@ -285,50 +298,51 @@ static void step2(void) {
     }
 
     case I2_ADD: {
-        word b = cpu.r[or2];
-        if (i2) b = or2;
-        cpu.r[dr] = cpu.r[or1] + b;
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = a + b;
+        alu_post;
         break;
     }
 
     case I2_SUB: {
-        word b = cpu.r[or2];
-        if (i2) b = or2;
-        cpu.r[dr] = cpu.r[or1] - b;
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = a - b;
+        alu_post;
         break;
     }
 
     case I2_MUL: {
-        word b = cpu.r[or2];
-        if (i2) b = or2;
-        cpu.r[dr] = (word)((uint32_t)cpu.r[or1] * b);
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = (word)((uint32_t)a * b);
+        alu_post;
         break;
     }
 
     case I2_AND: {
-        cpu.r[dr] = cpu.r[or1] & cpu.r[or2];
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = a & b;
+        alu_post;
         break;
     }
 
     case I2_OR: {
-        cpu.r[dr] = cpu.r[or1] | cpu.r[or2];
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = a | b;
+        alu_post;
         break;
     }
 
     case I2_NOT: {
-        cpu.r[dr] = ~cpu.r[or1];
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = ~a;
+        alu_post;
         break;
     }
 
     case I2_XOR: {
-        cpu.r[dr] = cpu.r[or1] ^ cpu.r[or2];
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = a ^ b;
+        alu_post;
         break;
     }
 
@@ -444,52 +458,51 @@ static void step2(void) {
     }
 
     case I2_SHL: {
-        word b = i2 ? or2 : cpu.r[or2];
-        cpu.r[dr] = b > 15 ? 0 : (word)(cpu.r[or1] << b);
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = b > 15 ? 0 : (word)(a << b);
+        alu_post;
         break;
     }
 
     case I2_SHR: {   /* logical */
-        word b = i2 ? or2 : cpu.r[or2];
-        cpu.r[dr] = b > 15 ? 0 : (word)(cpu.r[or1] >> b);
-        if (icc) set_cc(cpu.r[dr]);
+        alu_pre;
+        r = b > 15 ? 0 : (word)(a >> b);
+        alu_post;
         break;
     }
 
     case I2_SAR: {   /* arithmetic: sign bit fills in */
-        word b = i2 ? or2 : cpu.r[or2];
+        alu_pre;
         if (b > 15) b = 15;
-        cpu.r[dr] = (word)((int16_t)cpu.r[or1] >> b);
-        if (icc) set_cc(cpu.r[dr]);
+        r = (word)((int16_t)a >> b);
+        alu_post;
         break;
     }
 
     case I2_DIV: {   /* unsigned */
-        word b = i2 ? or2 : cpu.r[or2];
+        alu_pre;
         if (b == 0) {
             cpu.ir = mem[at0];
             bad(at0);
         }
-        cpu.r[dr] = cpu.r[or1] / b;
-        if (icc) set_cc(cpu.r[dr]);
+        r = a / b;
+        alu_post;
         break;
     }
 
     case I2_MOD: {   /* unsigned */
-        word b = i2 ? or2 : cpu.r[or2];
+        alu_pre;
         if (b == 0) {
             cpu.ir = mem[at0];
             bad(at0);
         }
-        cpu.r[dr] = cpu.r[or1] % b;
-        if (icc) set_cc(cpu.r[dr]);
+        r = a % b;
+        alu_post;
         break;
     }
 
     case I2_CMP: {   /* compares or1 with b, writes only the flags */
-        word a = cpu.r[or1];
-        word b = i2 ? or2 : cpu.r[or2];
+        alu_pre;
         cpu.cc[N] = (int16_t)a < (int16_t)b;
         cpu.cc[Z] = a == b;
         cpu.cc[P] = (int16_t)a > (int16_t)b;
@@ -512,26 +525,24 @@ static void step2(void) {
     }
 
     case I2_SDIV: {   /* signed, truncates toward zero */
-        int16_t a = (int16_t)cpu.r[or1];
-        int16_t b = (int16_t)(i2 ? or2 : cpu.r[or2]);
+        alu_pre;
         if (b == 0) {
             cpu.ir = mem[at0];
             bad(at0);
         }
-        cpu.r[dr] = (word)(a / b);
-        if (icc) set_cc(cpu.r[dr]);
+        r = (word)((int16_t)a / (int16_t)b);
+        alu_post;
         break;
     }
 
     case I2_SMOD: {   /* remainder takes the sign of the dividend */
-        int16_t a = (int16_t)cpu.r[or1];
-        int16_t b = (int16_t)(i2 ? or2 : cpu.r[or2]);
+        alu_pre;
         if (b == 0) {
             cpu.ir = mem[at0];
             bad(at0);
         }
-        cpu.r[dr] = (word)(a % b);
-        if (icc) set_cc(cpu.r[dr]);
+        r = (word)((int16_t)a % (int16_t)b);
+        alu_post;
         break;
     }
 

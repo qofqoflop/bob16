@@ -47,6 +47,12 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
   push rsp, rval  pop rd, rsp      call rsp, rtarget  ret rsp
   cmp rs1, rs2|imm4
   jmp jn jz jp jnz jle jge  rtarget
+  Memory operands: add sub mul and or not xor shl shr sar div mod sdiv smod cmp
+  accept [reg] for any operand: [rs1]/[rs2] read mem[reg] instead of reg, and a
+  bracketed destination [rd] stores the result to mem[rd], e.g.
+      add [r2], [r1], 5      ; mem[r2] = mem[r1] + 5
+      add r4, r3, [3]        ; [imm4] reads mem[0..15] directly
+      cmp [r1], [r2]
 """
 import argparse
 import ast
@@ -342,11 +348,31 @@ M2 = {
 M2_ALIAS = {'mov': 'move'}
 
 
+# ALU instructions accept [reg] memory operands: [dst] -> bit 5, [src1] -> bit 4,
+# [src2] -> bit 3 of the first word.  Roles by operand position:
+MEM_BIT = {'d': 0x20, '1': 0x10, '2': 0x08}
+MEM_ROLES = {'rrx': 'd12', 'rrr': 'd12', 'cmp': '12'}
+
+
 def enc2(env, mn, ops, cc):
     code, shape = M2[mn]
     R = lambda t: reg(t, 15)
     w0 = code << 8 | (0x80 if cc else 0)
     dr = o1 = o2 = 0
+
+    roles = MEM_ROLES.get(shape, 'd1' if mn == 'not' else '')
+    clean = []
+    for i, o in enumerate(ops):
+        t = o.strip()
+        if t.startswith('['):
+            if not t.endswith(']'):
+                raise AsmError("missing ']'")
+            if i >= len(roles):
+                raise AsmError("'%s' has no memory-operand form for operand %d" % (mn, i + 1))
+            w0 |= MEM_BIT[roles[i]]
+            t = t[1:-1].strip()
+        clean.append(t)
+    ops = clean
 
     def reg_or_imm4(tok):
         nonlocal w0
