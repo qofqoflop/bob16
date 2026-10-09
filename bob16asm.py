@@ -35,23 +35,29 @@ MODE 1 (16-bit instructions; the CPU boots in this mode)
   Pseudo: mov rd, rs | clr rd | li rd, imm(-64..63) | enter2 label
 
 MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
-        left again with `uext rX`)
+        left again with `uext`)
   Add `.cc` to a mnemonic to update the condition codes, e.g. add.cc
+  A 16-bit immediate (flag i3) makes the instruction 3 words long.  It is used
+  automatically wherever an immediate is accepted and is not a 0..15 literal.
   nop, halt
-  uext rd
-  add sub mul shl shr sar div mod sdiv smod   rd, rs1, rs2|imm4(0..15)
-  and or xor                                  rd, rs1, rs2
-  not rd, rs      move rd, rs      swap rd, rs     id rd, rs
-  load rd, raddr  load2 rd, raddr  stor raddr, rval   stor2 raddr, rval
-  in rd, rport    out rport, rval
-  push rsp, rval  pop rd, rsp      call rsp, rtarget  ret rsp
-  cmp rs1, rs2|imm4
-  jmp jn jz jp jnz jle jge  rtarget
-  Memory operands: add sub mul and or not xor shl shr sar div mod sdiv smod cmp
+  uext rd|addr
+  add sub mul and or xor shl shr sar div mod sdiv smod   rd, rs1, rs2|imm
+        (imm 0..15 uses the short form; anything else, negatives and forward
+         label references included, uses a 16-bit immediate: add r1, r1, -1)
+  not rd, rs      swap rd, rs     pop rd, rsp     ret rsp
+  move rd, rs|imm       load rd, raddr|imm     load2 rd, raddr|imm
+  stor raddr, rval|imm  stor2 raddr, rval|imm
+  in rd, rport|imm      out rport, rval|imm    id rd, rsel|imm
+  push rsp, rval|imm    call rsp, rtarget|imm
+  (id selectors ID_MAX ID_VERSION ID_FEATURES ID_MEMTOP ID_RS0 ID_REGS ID_OPCODES
+   ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK are predefined)
+  cmp rs1, rs2|imm
+  jmp jn jz jp jnz jle jge  rtarget|addr          (jmp loop)
+  Memory operands: add sub mul and or xor shl shr sar div mod sdiv smod cmp
   accept [reg] for any operand: [rs1]/[rs2] read mem[reg] instead of reg, and a
   bracketed destination [rd] stores the result to mem[rd], e.g.
       add [r2], [r1], 5      ; mem[r2] = mem[r1] + 5
-      add r4, r3, [3]        ; [imm4] reads mem[0..15] directly
+      add r4, r3, [0x2000]   ; absolute read: r4 = r3 + mem[0x2000]
       cmp [r1], [r2]
 """
 import argparse
@@ -93,6 +99,8 @@ class Env:
         self.final = final
         self.pc = 0
         self.mode = 1
+        self.item = None      # line being assembled (remembers its i3 decision)
+        self.undef = False    # set when an operand used a not-yet-defined symbol
 
 
 def eval_expr(text, env, strict=False):
@@ -116,6 +124,7 @@ def eval_expr(text, env, strict=False):
             if n.id in env.syms:
                 return env.syms[n.id]
             if not env.final and not strict:
+                env.undef = True
                 return 0
             raise AsmError("undefined symbol '%s'" % n.id)
         if isinstance(n, ast.BinOp) and type(n.op) in BIN_OPS:
@@ -333,16 +342,16 @@ def enc1(env, mn, ops):
 # mode 2
 # --------------------------------------------------------------------------
 M2 = {
-    'nop': (0, 'none'), 'halt': (1, 'none'), 'uext': (2, 'r'),
+    'nop': (0, 'none'), 'halt': (1, 'none'), 'uext': (2, 'j'),
     'add': (3, 'rrx'), 'sub': (4, 'rrx'), 'mul': (5, 'rrx'),
-    'and': (6, 'rrr'), 'or': (7, 'rrr'), 'not': (8, 'rr'), 'xor': (9, 'rrr'),
-    'jmp': (10, 'r'), 'jn': (11, 'r'), 'jz': (12, 'r'), 'jp': (13, 'r'),
-    'load': (14, 'rr'), 'load2': (15, 'rr'), 'stor': (16, 'rr'), 'stor2': (17, 'rr'),
-    'in': (18, 'rr'), 'out': (19, 'rr'), 'push': (20, 'rr'), 'pop': (21, 'rr'),
-    'move': (22, 'rr'), 'swap': (23, 'rr'), 'call': (24, 'rr'), 'ret': (25, 'r'),
-    'id': (26, 'rr'), 'shl': (27, 'rrx'), 'shr': (28, 'rrx'), 'sar': (29, 'rrx'),
+    'and': (6, 'rrx'), 'or': (7, 'rrx'), 'not': (8, 'rr'), 'xor': (9, 'rrx'),
+    'jmp': (10, 'j'), 'jn': (11, 'j'), 'jz': (12, 'j'), 'jp': (13, 'j'),
+    'load': (14, 'rs'), 'load2': (15, 'rs'), 'stor': (16, 'rs'), 'stor2': (17, 'rs'),
+    'in': (18, 'rs'), 'out': (19, 'rs'), 'push': (20, 'rs'), 'pop': (21, 'rr'),
+    'move': (22, 'rs'), 'swap': (23, 'rr'), 'call': (24, 'rs'), 'ret': (25, 'r'),
+    'id': (26, 'rs'), 'shl': (27, 'rrx'), 'shr': (28, 'rrx'), 'sar': (29, 'rrx'),
     'div': (30, 'rrx'), 'mod': (31, 'rrx'), 'cmp': (32, 'cmp'),
-    'jnz': (33, 'r'), 'jle': (34, 'r'), 'jge': (35, 'r'),
+    'jnz': (33, 'j'), 'jle': (34, 'j'), 'jge': (35, 'j'),
     'sdiv': (36, 'rrx'), 'smod': (37, 'rrx'),
 }
 M2_ALIAS = {'mov': 'move'}
@@ -351,7 +360,7 @@ M2_ALIAS = {'mov': 'move'}
 # ALU instructions accept [reg] memory operands: [dst] -> bit 5, [src1] -> bit 4,
 # [src2] -> bit 3 of the first word.  Roles by operand position:
 MEM_BIT = {'d': 0x20, '1': 0x10, '2': 0x08}
-MEM_ROLES = {'rrx': 'd12', 'rrr': 'd12', 'cmp': '12'}
+MEM_ROLES = {'rrx': 'd12', 'cmp': '12'}
 
 
 def enc2(env, mn, ops, cc):
@@ -374,34 +383,67 @@ def enc2(env, mn, ops, cc):
         clean.append(t)
     ops = clean
 
-    def reg_or_imm4(tok):
+    extra = []           # the optional third word (16-bit immediate, flag i3)
+
+    def imm16(tok):
+        nonlocal w0
+        v = eval_expr(tok, env)
+        if env.final and not -32768 <= v <= 65535:
+            raise AsmError("immediate %d does not fit in 16 bits" % v)
+        w0 |= 0x04
+        extra.append(v & 0xFFFF)
+
+    def reg_or_imm(tok):
+        """ALU second operand: register, 4-bit immediate (i2) or 16-bit immediate (i3).
+        i2 is only chosen when the value is known in pass 1 and fits 0..15, so a
+        line's size never depends on a forward reference."""
         nonlocal w0
         r = as_reg(tok, 15)
         if r is not None:
             return r
+        env.undef = False
+        v = eval_expr(tok, env)
+        it = env.item
+        if not env.final:
+            it.i3 = env.undef or not 0 <= v <= 15
+        if it.i3:
+            imm16(tok)
+            return 0
         w0 |= 0x40
-        return chk_unsigned(env, eval_expr(tok, env), 4, "immediate")
+        return chk_unsigned(env, v, 4, "immediate")
 
     if shape == 'none':
         need(mn, ops, 0)
     elif shape == 'r':
         need(mn, ops, 1)
         dr = R(ops[0])
+    elif shape == 'j':                      # jump target: register or 16-bit address
+        need(mn, ops, 1)
+        r = as_reg(ops[0], 15)
+        if r is not None:
+            dr = r
+        else:
+            imm16(ops[0])
     elif shape == 'rr':
         need(mn, ops, 2)
         dr, o1 = R(ops[0]), R(ops[1])
-    elif shape == 'rrr':
-        need(mn, ops, 3)
-        dr, o1, o2 = R(ops[0]), R(ops[1]), R(ops[2])
+    elif shape == 'rs':                     # second operand: register or 16-bit immediate
+        need(mn, ops, 2)
+        dr = R(ops[0])
+        r = as_reg(ops[1], 15)
+        if r is not None:
+            o1 = r
+        else:
+            imm16(ops[1])
     elif shape == 'rrx':
         need(mn, ops, 3)
         dr, o1 = R(ops[0]), R(ops[1])
-        o2 = reg_or_imm4(ops[2])
+        o2 = reg_or_imm(ops[2])
     elif shape == 'cmp':
         need(mn, ops, 2)
         o1 = R(ops[0])
-        o2 = reg_or_imm4(ops[1])
-    return [w0, dr << 12 | o1 << 8 | o2 << 4]
+        o2 = reg_or_imm(ops[1])
+    return [w0, dr << 12 | o1 << 8 | o2 << 4] + extra
 
 
 # --------------------------------------------------------------------------
@@ -410,6 +452,7 @@ def enc2(env, mn, ops, cc):
 class Item:
     def __init__(self, lineno, text, labels, mn, optext):
         self.lineno, self.text, self.labels, self.mn, self.optext = lineno, text, labels, mn, optext
+        self.i3 = None        # mode 2: does this line need the 3rd (16-bit immediate) word?
 
 
 def strip_comment(line):
@@ -588,6 +631,7 @@ def directive(env, it):
 
 def process(env, it):
     mn = it.mn
+    env.item = it
     if mn.startswith('.'):
         return directive(env, it)
     ops = split_ops(it.optext)
@@ -640,8 +684,17 @@ def run_pass(items, syms, final, errors, mem=None, listing=None):
     return env
 
 
+# predefined symbols, for `id` selectors and feature bits (keep in sync with bob16.c)
+BUILTINS = {
+    'ID_MAX': 0, 'ID_VERSION': 1, 'ID_FEATURES': 2, 'ID_MEMTOP': 3, 'ID_RS0': 4,
+    'ID_REGS': 5, 'ID_OPCODES': 6, 'ID_PORTS': 7,
+    'ID_NAME0': 8, 'ID_NAME1': 9, 'ID_NAME2': 10,
+    'FEAT_MEMOPS': 1, 'FEAT_IMM16': 2, 'FEAT_SDIV': 4, 'FEAT_IO': 8, 'FEAT_STACK': 16,
+}
+
+
 def assemble(text):
-    errors, syms, mem, listing = [], {}, {}, []
+    errors, syms, mem, listing = [], dict(BUILTINS), {}, []
     items = parse_source(text, errors)
     run_pass(items, syms, False, errors)
     if errors:
@@ -695,4 +748,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

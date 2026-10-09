@@ -35,6 +35,28 @@ enum { I2_NOP, I2_HALT, I2_UEXT, I2_ADD,
        I2_CMP, I2_JNZ, I2_JLE, I2_JGE,
        I2_SDIV, I2_SMOD };
 
+/* id selectors (cpuid-like): `id rd, sel` puts the answer for `sel` in rd.
+ * Unknown selectors return 0; ID_MAX returns the highest valid selector. */
+enum { ID_MAX,        /* highest valid selector */
+       ID_VERSION,    /* (major << 8) | minor */
+       ID_FEATURES,   /* FEAT_* bit mask */
+       ID_MEMTOP,     /* highest valid memory address */
+       ID_RS0,        /* status register rs0 (bit 0 = extended mode) */
+       ID_REGS,       /* (mode-1 register count << 8) | mode-2 register count */
+       ID_OPCODES,    /* number of mode-2 opcodes */
+       ID_PORTS,      /* bit n set = in/out port n exists */
+       ID_NAME0,      /* name string "BOB-16", two chars per selector, */
+       ID_NAME1,      /*   first char in the high byte */
+       ID_NAME2 };
+
+enum { FEAT_MEMOPS = 1 << 0,   /* [reg] memory operands on ALU instructions */
+       FEAT_IMM16  = 1 << 1,   /* i3: 16-bit immediate third word */
+       FEAT_SDIV   = 1 << 2,   /* signed sdiv / smod */
+       FEAT_IO     = 1 << 3,   /* in / out */
+       FEAT_STACK  = 1 << 4 }; /* push / pop / call / ret */
+
+#define BOB16_VERSION 0x0100   /* 1.0 */
+
 static struct {
     word r[16];
     word ir;
@@ -256,11 +278,17 @@ static void step1(void) {
     }
 }
 
-#define alu_pre word r, a, b; \
+#define alu_src word a, b; \
                 a = cpu.r[or1]; \
-                b = i2 ? or2 : cpu.r[or2]; \
+                b = i2 ? or2 : i3 ? mem[at2] : cpu.r[or2]; \
                 if (imem1) a = mem[a]; \
                 if (imem2) b = mem[b]
+
+#define alu_pre word r; alu_src
+
+/* With i3 set, the third word replaces the or1 operand of non-ALU
+ * instructions (move/load/stor/in/out/push/call/id) */
+#define or1v (i3 ? mem[at2] : cpu.r[or1])
 
 #define alu_post if (icc) set_cc(r); \
                  if (imemd) mem[cpu.r[dr]] = r; \
@@ -276,12 +304,38 @@ static void step2(void) {
     word imemd = (mem[at0] >> 5) & 0x1;
     word imem1 = (mem[at0] >> 4) & 0x1;
     word imem2 = (mem[at0] >> 3) & 0x1;
+    word i3 = (mem[at0] >> 2) & 0x1;
 
     word dr = (mem[at1] >> 12) & 0xF;
     word or1 = (mem[at1] >> 8) & 0xF;
     word or2 = (mem[at1] >> 4) & 0xF;
 
-    switch ((mem[at0] >> 8) & 0xFF) {
+    word at2 = at1 + 1;
+    word opc = (mem[at0] >> 8) & 0xFF;
+
+    cpu.ir = mem[at0];
+    if (i3) {
+        /* i3 = third word holds a 16-bit immediate; only some ops take it */
+        switch (opc) {
+        case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
+        case I2_XOR: case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
+        case I2_MOD: case I2_CMP: case I2_SDIV: case I2_SMOD:
+            if (i2) bad(at0);        /* i2 and i3 are mutually exclusive */
+            break;
+        case I2_JMP: case I2_JN: case I2_JZ: case I2_JP:
+        case I2_JNZ: case I2_JLE: case I2_JGE:
+        case I2_UEXT:                    /* target replaces r[dr] */
+        case I2_LOAD: case I2_LOAD2: case I2_STOR: case I2_STOR2:
+        case I2_IN: case I2_OUT: case I2_PUSH: case I2_MOVE:
+        case I2_CALL: case I2_ID:        /* immediate replaces r[or1] */
+            break;
+        default:
+            bad(at0);
+        }
+        cpu.pc++;
+    }
+
+    switch (opc) {
     case I2_NOP: {
         break;
     }
@@ -293,7 +347,7 @@ static void step2(void) {
 
     case I2_UEXT: {
         cpu.rs0 = cpu.rs0 & 0xFFFE;
-        cpu.pc = cpu.r[dr];
+        cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
@@ -347,57 +401,58 @@ static void step2(void) {
     }
 
     case I2_JMP: {
-        cpu.pc = cpu.r[dr];
+        cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_JN: {
-        if (cpu.cc[N]) cpu.pc = cpu.r[dr];
+        if (cpu.cc[N]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_JZ: {
-        if (cpu.cc[Z]) cpu.pc = cpu.r[dr];
+        if (cpu.cc[Z]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_JP: {
-        if (cpu.cc[P]) cpu.pc = cpu.r[dr];
+        if (cpu.cc[P]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_LOAD: {
-        cpu.r[dr] = mem[cpu.r[or1]];
+        cpu.r[dr] = mem[or1v];
         if (icc) set_cc(cpu.r[dr]);
         break;
     }
 
     case I2_LOAD2: {
-        cpu.r[dr] = mem[mem[cpu.r[or1]]];
+        cpu.r[dr] = mem[mem[or1v]];
         if (icc) set_cc(cpu.r[dr]);
         break;
     }
 
     case I2_STOR: {
-        mem[cpu.r[dr]] = cpu.r[or1];
-        if (icc) set_cc(cpu.r[or1]);
+        mem[cpu.r[dr]] = or1v;
+        if (icc) set_cc(or1v);
         break;
     }
 
     case I2_STOR2: {
-        mem[mem[cpu.r[dr]]] = cpu.r[or1];
-        if (icc) set_cc(cpu.r[or1]);
+        mem[mem[cpu.r[dr]]] = or1v;
+        if (icc) set_cc(or1v);
         break;
     }
 
     case I2_IN: {
-        switch (cpu.r[or1]) {
+        switch (or1v) {
         case 0x0:
+            fflush(stdout);
             cpu.r[dr] = (word)getchar();
             if (icc) set_cc(cpu.r[dr]);
             break;
         default:
-            running = false;
+            bad(at0);
         }
         break;
     }
@@ -405,16 +460,16 @@ static void step2(void) {
     case I2_OUT: {
         switch (cpu.r[dr]) {
         case 0x0:
-            putchar((char)cpu.r[or1]);
+            putchar((char)or1v);
             break;
         default:
-            running = false;
+            bad(at0);
         }
         break;
     }
 
     case I2_PUSH: {
-        mem[cpu.r[dr]--] = cpu.r[or1];
+        mem[cpu.r[dr]--] = or1v;
         break;
     }
 
@@ -425,7 +480,7 @@ static void step2(void) {
     }
 
     case I2_MOVE: {
-        cpu.r[dr] = cpu.r[or1];
+        cpu.r[dr] = or1v;
         if (icc) set_cc(cpu.r[dr]);
         break;
     }
@@ -439,8 +494,8 @@ static void step2(void) {
     }
 
     case I2_CALL: {
-        mem[cpu.r[dr]--] = cpu.pc;
-        cpu.pc = cpu.r[or1];
+        mem[cpu.r[dr]--] = cpu.pc;      /* pc already points past the i3 word */
+        cpu.pc = or1v;
         break;
     }
 
@@ -450,10 +505,24 @@ static void step2(void) {
     }
 
     case I2_ID: {
-        switch (cpu.r[or1]) {
-        default:
-            cpu.r[dr] = 0;
+        word v;
+        switch (or1v) {
+        case ID_MAX:      v = ID_NAME2; break;
+        case ID_VERSION:  v = BOB16_VERSION; break;
+        case ID_FEATURES: v = FEAT_MEMOPS | FEAT_IMM16 | FEAT_SDIV |
+                              FEAT_IO | FEAT_STACK; break;
+        case ID_MEMTOP:   v = (word)(MEM_WORDS - 1); break;
+        case ID_RS0:      v = cpu.rs0; break;
+        case ID_REGS:     v = (8 << 8) | 16; break;
+        case ID_OPCODES:  v = I2_SMOD + 1; break;
+        case ID_PORTS:    v = 0x1; break;               /* port 0 = console */
+        case ID_NAME0:    v = ('B' << 8) | 'O'; break;
+        case ID_NAME1:    v = ('B' << 8) | '-'; break;
+        case ID_NAME2:    v = ('1' << 8) | '6'; break;
+        default:          v = 0;
         }
+        cpu.r[dr] = v;
+        if (icc) set_cc(v);
         break;
     }
 
@@ -482,7 +551,6 @@ static void step2(void) {
     case I2_DIV: {   /* unsigned */
         alu_pre;
         if (b == 0) {
-            cpu.ir = mem[at0];
             bad(at0);
         }
         r = a / b;
@@ -493,7 +561,6 @@ static void step2(void) {
     case I2_MOD: {   /* unsigned */
         alu_pre;
         if (b == 0) {
-            cpu.ir = mem[at0];
             bad(at0);
         }
         r = a % b;
@@ -502,7 +569,7 @@ static void step2(void) {
     }
 
     case I2_CMP: {   /* compares or1 with b, writes only the flags */
-        alu_pre;
+        alu_src;
         cpu.cc[N] = (int16_t)a < (int16_t)b;
         cpu.cc[Z] = a == b;
         cpu.cc[P] = (int16_t)a > (int16_t)b;
@@ -510,24 +577,23 @@ static void step2(void) {
     }
 
     case I2_JNZ: {
-        if (!cpu.cc[Z]) cpu.pc = cpu.r[dr];
+        if (cpu.cc[N] || cpu.cc[P]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_JLE: {   /* N or Z */
-        if (!cpu.cc[P]) cpu.pc = cpu.r[dr];
+        if (cpu.cc[N] || cpu.cc[Z]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_JGE: {   /* Z or P */
-        if (!cpu.cc[N]) cpu.pc = cpu.r[dr];
+        if (cpu.cc[Z] || cpu.cc[P]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
     case I2_SDIV: {   /* signed, truncates toward zero */
         alu_pre;
         if (b == 0) {
-            cpu.ir = mem[at0];
             bad(at0);
         }
         r = (word)((int16_t)a / (int16_t)b);
@@ -538,7 +604,6 @@ static void step2(void) {
     case I2_SMOD: {   /* remainder takes the sign of the dividend */
         alu_pre;
         if (b == 0) {
-            cpu.ir = mem[at0];
             bad(at0);
         }
         r = (word)((int16_t)a % (int16_t)b);
