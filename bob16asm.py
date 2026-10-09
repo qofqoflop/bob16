@@ -30,7 +30,7 @@ MODE 1 (16-bit instructions; the CPU boots in this mode)
   ld / ldi / st / sti / lea   reg, label        (pc-relative, +-256 words)
   ldr / str  rd, rb, off6     or  rd, [rb+off]  (off -32..31)
   br[n][z][p] label           (plain `br` = always)
-  jmp rd | ret | jsr label | jsrr rs
+  jmp rd | ret | jsr label (+-1024 words) | jsrr rs
   trap n | halt | putc | puts | gets | ext
   Pseudo: mov rd, rs | clr rd | li rd, imm(-64..63) | enter2 label
 
@@ -280,23 +280,13 @@ def enc1(env, mn, ops):
         need(mn, ops, 0)
         return [14 << 12]
 
-    if mn == 'jsr':
+    if mn == 'jsr':          # bit 11 clear = imm11 (signed), as in the original bob16
         need(mn, ops, 1)
-        off = rel_off(env, eval_expr(ops[0], env))
-        if env.final and not 0 <= off <= 1023:
-            raise AsmError(
-                "jsr can only reach 0..+1023 words forward (distance is %d). The emulator "
-                "treats bit 10 of the offset as the jsr/jsrr selector, so backward calls "
-                "can't be encoded; use  lea r6, target ; jsrr r6  instead" % off)
-        return [12 << 12 | (off & 0x3FF)]
+        return [12 << 12 | rel(env, eval_expr(ops[0], env), 11)]
 
-    if mn == 'jsrr':
+    if mn == 'jsrr':         # bit 11 set, register in bits 10:8
         need(mn, ops, 1)
-        r = R(ops[0])
-        if r < 4:
-            raise AsmError("jsrr can only use r4..r7 (the emulator reads the register "
-                           "from bits 10:8 and bit 10 is always set)")
-        return [12 << 12 | r << 8]
+        return [12 << 12 | 0x800 | R(ops[0]) << 8]
 
     if mn == 'trap':
         need(mn, ops, 1)

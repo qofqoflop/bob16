@@ -208,17 +208,16 @@ static void step1(void) {
         cpu.pc = cpu.r[dr];
         break;
 
-    case JSR:
-        if (!(ir & 0x400)) {                      /* jsr imm11 */
-            word target = (word)(cpu.pc + sext(ir & 0x7FF, 11));
-            cpu.r[7] = cpu.pc;
-            cpu.pc = target;
-        } else {                                  /* jsrr rs */
-            word target = cpu.r[(ir >> 8) & 7];
-            cpu.r[7] = cpu.pc;
-            cpu.pc = target;
-        }
+    case JSR: {
+        /* same encoding as the original bob16: bit 11 clear = jsr imm11
+         * (signed, bits 10:0), bit 11 set = jsrr rs (rs in bits 10:8).
+         * The target is read before r7 is overwritten, so jsrr r7 works. */
+        word target = (ir & 0x800) ? cpu.r[(ir >> 8) & 7]
+                                   : (word)(cpu.pc + sext(ir & 0x7FF, 11));
+        cpu.r[7] = cpu.pc;
+        cpu.pc = target;
         break;
+    }
 
     case LEA:
         res = (word)(cpu.pc + sext(ir & 0x1FF, 9));
@@ -247,6 +246,7 @@ static void step1(void) {
                 putchar(mem[a] & 0xFF);
             }
             putchar('\n');
+            cpu.r[0] = 0;   /* the original leaves the terminator (0) in r0 */
             break;
         }
 
@@ -271,8 +271,8 @@ static void step1(void) {
             break;
         }
 
-        default:
-            bad(at);
+        default:        /* vectors 5-15 are no-ops, as in the original */
+            break;
         }
         break;
     }
