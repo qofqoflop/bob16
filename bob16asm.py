@@ -62,6 +62,11 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
   ldb rd, raddr|imm  stb raddr, rval|imm
         (byte addresses: word = addr>>1, even = low byte)
   peek rd, rsp|imm   pushm rsp, mask   popm rsp, mask   jal rd, rtarget|imm
+  cbz/cbnz rs, rtarget|addr   tbz/tbnz rs, bit, rtarget|addr
+  ldx rd, rb, ri   stx rb, ri, rv   copy rd, rs, rc   fill rd, rc, rv
+  rev/clz/ctz/popcnt rd, rs   min/max/andn rd, rs1, rs2|imm   btc rd, rs, bit
+  cselz/cselc/cseln rd, rs1, rs2|imm   enter rfp, rsp, size   leave rfp, rsp
+  getcc rd   setcc rmask|imm   (cc bits: N=8,Z=4,P=2,C=1)
   move rd, rs|imm       load rd, raddr|imm     load2 rd, raddr|imm
   stor raddr, rval|imm  stor2 raddr, rval|imm
   in rd, rport|imm      out rport, rval|imm    id rd, rsel|imm
@@ -489,7 +494,14 @@ M2 = {
     'pushm': (56, 'rs'), 'popm': (57, 'rs'), 'jal': (58, 'rs'),
     'fadd': (59, 'rrx'), 'fsub': (60, 'rrx'), 'fmul': (61, 'rrx'),
     'fdiv': (62, 'rrx'), 'fcmp': (63, 'cmp'), 'itof': (64, 'rr'),
-    'ftoi': (65, 'rr')
+    'ftoi': (65, 'rr'), 'cbz': (66, 'cb'), 'cbnz': (67, 'cb'),
+    'tbz': (68, 'tb'), 'tbnz': (69, 'tb'), 'ldx': (70, 'rrr'),
+    'stx': (71, 'rrr'), 'copy': (72, 'rrx'), 'fill': (73, 'rrx'),
+    'rev': (74, 'rr'), 'clz': (75, 'rr'), 'ctz': (76, 'rr'),
+    'popcnt': (77, 'rr'), 'min': (78, 'rrx'), 'max': (79, 'rrx'),
+    'cselz': (80, 'rrx'), 'cseln': (81, 'rrx'), 'cselc': (82, 'rrx'),
+    'andn': (83, 'rrx'), 'btc': (84, 'rrx'), 'enter': (85, 'rrx'),
+    'leave': (86, 'rr'), 'getcc': (87, 'r'), 'setcc': (88, 'j')
 }
 M2_ALIAS = {'mov': 'move', 'li': 'move'}
 M2_MACROS = {'inc', 'dec', 'clr'}
@@ -543,7 +555,8 @@ def enc2(env, mn, ops, cc):
     if shape == 'rrx' and len(ops) == 2:        # `add rd, x`  ==  `add rd, rd, x`
         ops = [ops[0], ops[0], ops[1]]
 
-    roles = MEM_ROLES.get(shape, 'd1' if mn in ('not', 'neg', 'itof', 'ftoi') else '')
+    roles = MEM_ROLES.get(shape, 'd1' if mn in ('not', 'neg', 'itof', 'ftoi',
+                                                'rev', 'clz', 'ctz', 'popcnt') else '')
     bases, mems = [], []
     for i, o in enumerate(ops):
         t = o.strip()
@@ -591,24 +604,74 @@ def enc2(env, mn, ops, cc):
 
     if shape == 'none':
         need(mn, ops, 0)
-    elif shape == 'r':                        # ret: dr is SP, +off = post-adjust
+    elif shape == 'r':
         need(mn, ops, 1)
-        ro = split_reg_off(ops[0], 15, env)
-        dr = ro[0] if ro is not None else R(ops[0])
-        if ro is not None:
-            set_doff(ro[1])
+        if mn == 'ret':                       # ret: dr is SP, +off = post-adjust
+            ro = split_reg_off(ops[0], 15, env)
+            dr = ro[0] if ro is not None else R(ops[0])
+            if ro is not None:
+                set_doff(ro[1])
+        else:                                 # getcc: plain destination
+            dr = no_off(ops[0], "destination")
     elif shape == 'j':                        # jump target: register or 16-bit address
         need(mn, ops, 1)                      # `jmp r1+5` uses high byte; imm folds
-        ro = split_reg_off(ops[0], 15, env)
-        if ro is not None:
-            dr = ro[0]
-            set_doff(ro[1])
-        else:
+        if mn in ('setcc',):                     # mask value: no offsets
+            if split_reg_off(ops[0], 15, env) is not None:
+                raise AsmError("offsets not allowed on the mask value")
             r = as_reg(ops[0], 15)
             if r is not None:
                 dr = r
             else:
                 imm16(ops[0])
+        else:
+            ro = split_reg_off(ops[0], 15, env)
+            if ro is not None:
+                dr = ro[0]
+                set_doff(ro[1])
+            else:
+                r = as_reg(ops[0], 15)
+                if r is not None:
+                    dr = r
+                else:
+                    imm16(ops[0])
+    elif shape == 'cb':                       # `cbz rs, target+off`
+        need(mn, ops, 2)
+        dr = no_off(ops[0], "tested register")
+        ro = split_reg_off(ops[1], 15, env)
+        if ro is not None:
+            o1 = ro[0]
+            set_soff(ro[1])
+        else:
+            r = as_reg(ops[1], 15)
+            if r is not None:
+                o1 = r
+            else:
+                imm16(ops[1])
+    elif shape == 'tb':                       # `tbz rs, bit, target`
+        need(mn, ops, 3)
+        dr = no_off(ops[0], "tested register")
+        r = as_reg(ops[1], 15)                # bit: reg or 0..15 (i2)
+        if r is not None:
+            o1 = r
+        else:
+            env.undef = False
+            v = eval_expr(ops[1], env)
+            if not env.final and env.undef:
+                o1 = 0
+                w0 |= 0x40
+            else:
+                o1 = chk_unsigned(env, v, 4, "bit index")
+                w0 |= 0x40
+        r = as_reg(ops[2], 15)                # target: reg or 16-bit only
+        if r is not None:
+            o2 = r
+        else:
+            imm16(ops[2])
+    elif shape == 'rrr':                      # three plain registers, no extras
+        need(mn, ops, 3)
+        dr = no_off(ops[0], "destination")
+        o1 = no_off(ops[1], "source")
+        o2 = no_off(ops[2], "source")
     elif shape == 'rr':
         if mn == 'neg' and len(ops) == 1:    # legacy `neg rd` == `neg rd, rd`
             ops = [ops[0], ops[0]]
@@ -630,6 +693,9 @@ def enc2(env, mn, ops, cc):
                 set_soff(ro[1])
             else:
                 o1 = R(ops[1])
+        elif mn == 'leave':                   # plain registers only
+            dr = no_off(ops[0], "frame pointer")
+            o1 = no_off(ops[1], "stack pointer")
         else:                                 # not/neg/itof/ftoi
             if mems[0]:
                 ro = split_reg_off(ops[0], 15, env)
@@ -683,6 +749,15 @@ def enc2(env, mn, ops, cc):
             if mems[0]:
                 raise AsmError("'divmod' quotient goes to a plain register")
             dr = no_off(ops[0], "destination")
+        elif mn in ('copy', 'fill', 'enter'):  # plain regs; o2 takes the immediate
+            if mems[0] or mems[1] or mems[2]:
+                raise AsmError("'%s' takes plain registers (no [mem] form)" % mn)
+            dr = no_off(ops[0], "destination")
+            o1 = no_off(ops[1], "source")
+            if split_reg_off(ops[2], 15, env) is not None:
+                raise AsmError("offsets not allowed on the third operand")
+            o2 = reg_or_imm(ops[2])
+            return [w0, dr << 12 | o1 << 8 | o2 << 4] + extra
         elif mems[0]:                         # `[rd+off]` destination offset
             ro = split_reg_off(ops[0], 15, env)
             if ro is not None:
@@ -989,7 +1064,8 @@ BUILTINS = {
     'ID_NAME0': 8, 'ID_NAME1': 9, 'ID_NAME2': 10,
     'FEAT_MEMOPS': 1, 'FEAT_IMM16': 2, 'FEAT_SDIV': 4, 'FEAT_IO': 8, 'FEAT_STACK': 16,
     'FEAT_OFF': 32, 'FEAT_EXTALU': 64, 'FEAT_MEMB': 128, 'FEAT_STACK2': 256,
-    'FEAT_JX': 512, 'FEAT_FP': 1024,
+    'FEAT_JX': 512, 'FEAT_FP': 1024, 'FEAT_CBR': 2048, 'FEAT_IDX': 4096,
+    'FEAT_BLK': 8192, 'FEAT_BIT2': 16384, 'FEAT_ALU2': 32768,
 }
 
 

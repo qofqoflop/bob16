@@ -33,13 +33,18 @@ Append `.cc` to update the condition codes, e.g. `add.cc`.
   `divmod rq, rn, rd` writes quotient to `rq` and remainder back into `rn`).
 * Flags-only: `cmp tst btst` (`btst` also copies the tested bit into C).
 * Jumps: `jmp jn jz jp jnz jle jge jc jnc`, `jal rd, target` (link in a
-  register), `call rsp, target` / `ret rsp+off` (stack, with cleanup offset).
+  register), `call rsp, target` / `ret rsp+off` (stack, with cleanup offset),
+  `cbz`/`cbnz rs, target` (flag-preserving), `tbz`/`tbnz rs, bit, target.
 * Memory: `load load2 stor stor2 ldb stb`; bytes are addressed as
   `word = addr>>1`, even address = low byte (`ldb` zero-extends,
   `stb` preserves the other half).
 * Moves/system: `move swap in out id push pop peek pushm popm`
   (`pop rd, rsp+off` peeks ahead, `peek` never pops,
   `pushm`/`popm rsp, mask` save/restore every register in a bit mask).
+* x86/ARM-inspired: `ldx`/`stx` (base+index), `copy`/`fill` (block ops),
+  `rev`/`clz`/`ctz`/`popcnt`, `min`/`max` (signed), `cselz`/`cseln`/`cselc`
+  (branchless select), `andn`, `btc`, `enter`/`leave` (stack frames),
+  `getcc`/`setcc` (flag save/restore, bits N=8,Z=4,P=2,C=1).
 * Operands: 4-bit short immediates (`0..15`, flag `i2`), 16-bit immediates
   (flag `i3`, automatic), `[reg]` memory operands, and `rN+/-off` /
   `[rN+/-off]` 8-bit offsets (flag `i4/i5`, `-255..255`, src = low byte,
