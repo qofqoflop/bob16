@@ -45,9 +45,10 @@ Templates (C++-style generics, monomorphized at parse time):
 
 Defer: `defer f(x);` or `defer { ... }` runs the code when the enclosing
   scope ends (LIFO; also on return/break/continue, and per loop
-  iteration). Deferred code is late-bound (sees variables as they are at
-  run time) and shares the function's frame. No `return` inside deferred
-  code. Needs the 256-entry runtime stack (emitted only when used).
+  iteration). Entries live on the main stack, so capacity grows with the
+  frame. Deferred code is late-bound (sees variables as they are at run
+  time) and shares the function's frame. No `return` inside deferred
+  code.
 
 `#include "other.b"` splices another file into the unit (relative to the
   including file; nested includes work; each file is included at most
@@ -1505,17 +1506,13 @@ class Gen:
         self.func_labels = {} # asm label -> function key (collision guard)
         self.defer_seq = 0    # program-wide deferred-body counter
         self.deferred = []    # Defer nodes pending end-of-program emission
-        self.need_defer = False
         self.in_defer = 0
         self.func_defer = False
         self.base_mark = None
+        self.ret_save = None
         self.scratch_base = 0
         self.scratch_size = 0
         self.defer_sites = []
-        # defer runtime globals (emitted only when used)
-        self.DSTACK = 'G_defer_stack'
-        self.DTOP = 'G_defer_top'
-        self.DMAX = 256
 
     def fp_off(self, name):
         """frame operand offset from r11: params +(2+i); locals address the
@@ -2279,23 +2276,18 @@ class Gen:
         if isinstance(st, Block):
             mark = getattr(st, '_mark', None)
             if mark is not None:
-                self.emit('load r0, %s' % self.DTOP)
+                self.emit('move r0, r10')
                 self.emit('stor %s, r0' % self.mark_op(mark))
             for s in st.stmts:
                 self.gen_stmt(s)
             if mark is not None:
                 self.gen_unwind_to_mark(mark)
         elif isinstance(st, Defer):
+            # entries share the main stack: capacity grows with the frame.
+            # (At statement boundaries expression temps are balanced away,
+            # so the top of r10 holds only defer entries down to the mark.)
             self.emit('move r0, %s' % st._label)
-            self.emit('load r1, %s' % self.DTOP)
-            self.emit('cmp r1, %d' % self.DMAX)
-            self.emit('jge DTrap')
-            self.emit('move r2, %s' % self.DSTACK)
-            self.emit('add r2, r1')
-            self.emit('stor r2, r0')
-            self.emit('inc r1')
-            self.emit('move r2, %s' % self.DTOP)
-            self.emit('stor r2, r1')
+            self.emit('push r10, r0')
         elif isinstance(st, Decl):
             self.gen_decl(st, global_=False)
         elif isinstance(st, ExprStmt):
@@ -2371,9 +2363,13 @@ class Gen:
                 self.gen(st.val)
                 self.conv(self.norm(self.cur_ret), self.rtype(st.val))
             if self.func_defer:
-                self.emit('push r10, r0')
+                if st.val is not None:
+                    # r0 cannot wait on r10 (pending entries sit on top),
+                    # so the value waits in a hidden frame slot instead
+                    self.emit('stor %s, r0' % self.mark_op(self.ret_save))
                 self.gen_unwind_base()
-                self.emit('pop r0, r10')
+                if st.val is not None:
+                    self.emit('load r0, %s' % self.mark_op(self.ret_save))
                 self.emit('jmp %s' % self.retend)
             else:
                 self.emit('jmp %s' % self.end)
@@ -2499,19 +2495,16 @@ class Gen:
             self.collect_scratch(st.body, loc, sizes, vts, arrs, total)
 
     def gen_unwind_to_mark(self, slot):
-        # reload the mark inside the loop: called bodies clobber r0-r2
+        # entries live on the main stack below sp; pop+call until sp is
+        # back at the mark. The mark is reloaded every iteration because
+        # called bodies clobber r0-r2. Comparison is for equality only,
+        # so stack addresses compare fine.
         lu, ld = self.label('U'), self.label('U')
         self.emit('%s:' % lu)
         self.emit('load r0, %s' % self.mark_op(slot))
-        self.emit('load r1, %s' % self.DTOP)
-        self.emit('cmp r1, r0')
+        self.emit('cmp r10, r0')
         self.emit('jz %s' % ld)
-        self.emit('dec r1')
-        self.emit('move r2, %s' % self.DTOP)
-        self.emit('stor r2, r1')
-        self.emit('move r2, %s' % self.DSTACK)
-        self.emit('add r2, r1')
-        self.emit('load r2, r2')
+        self.emit('pop r2, r10')
         self.emit('call r10, r2')
         self.emit('jmp %s' % lu)
         self.emit('%s:' % ld)
@@ -2804,21 +2797,10 @@ class Gen:
         for fd in funcs:
             if fd.name != 'main':
                 self.gen_func(fd)
-        if self.need_defer:
-            self.gen_defer_runtime()
+        if self.deferred:
             self.gen_deferred_bodies()
         for d in self.data:
             self.emit(d)
-
-    def gen_defer_runtime(self):
-        for gname in ('defer_stack', 'defer_top'):
-            if gname in self.globals:
-                raise self.fail("'%s' is already defined" % gname)
-        self.data.append('%-8s .fill %d' % ('G_defer_stack:', self.DMAX))
-        self.data.append('%-8s .word 0' % 'G_defer_top:')
-        self.emit('DTrap:')
-        self.emit('clr r0')
-        self.emit('div r0, r0, r0')  # div by zero: overflow trap
 
     def gen_deferred_bodies(self):
         for site in self.deferred:
@@ -2864,12 +2846,13 @@ class Gen:
         # defer pre-pass: scope marks, body labels/scratch (frame grows)
         self.defer_sites = []
         self.base_mark = None
+        self.ret_save = None
         self.scratch_base = 0
         self.scratch_size = 0
         self.func_defer = self.mark_scopes(fd.body, is_root=True)
         if self.func_defer:
-            self.need_defer = True
             self.base_mark = self.alloc_hidden()
+            self.ret_save = self.alloc_hidden()
             self.scratch_base = self.nslots
             for site in self.defer_sites:
                 self.plan_defer_body(site)
@@ -2889,7 +2872,7 @@ class Gen:
             self.emit(lab + ':')
         self.emit('enter r11, r10, %d' % n)
         if self.func_defer:
-            self.emit('load r0, %s' % self.DTOP)
+            self.emit('move r0, r10')
             self.emit('stor %s, r0' % self.mark_op(self.base_mark))
         self.gen_stmt(fd.body)
         if self.func_defer:
