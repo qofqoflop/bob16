@@ -33,15 +33,26 @@ MODE 1 (16-bit instructions; the CPU boots in this mode)
   jmp rd | ret | jsr label (+-1024 words) | jsrr rs
   trap n | halt | putc | puts | gets | ext
   Pseudo: mov rd, rs | clr rd | li rd, imm(-64..63) | enter2 label
+  Macros (they set the condition codes like the instructions they expand to):
+    inc rd | inc rd, rs        rd = rs + 1                              (1 word)
+    dec rd | dec rd, rs        rd = rs - 1                              (1 word)
+    neg rd | neg rd, rs        rd = -rs  (not; add 1)                   (2 words)
+    tst rd                     set cc from rd                           (1 word)
+    shl rd [, n]               rd <<= n (1..16) by doubling             (n words)
+    sub rd, x | sub rd, rs1, x   x = register or immediate; no scratch  (1-3 words)
+    push rsp, rv | pop rd, rsp   stack in memory, same layout as mode 2 (2 words)
 
 MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
         left again with `uext`)
   Add `.cc` to a mnemonic to update the condition codes, e.g. add.cc
+  Macros: inc dec neg clr tst (all take .cc and [reg] memory operands, e.g. inc [r1]),
+          li = move, and any 3-operand ALU op may drop its first source:
+          `add r1, 5` means `add r1, r1, 5`.
   A 16-bit immediate (flag i3) makes the instruction 3 words long.  It is used
   automatically wherever an immediate is accepted and is not a 0..15 literal.
   nop, halt
   uext rd|addr
-  add sub mul and or xor shl shr sar div mod sdiv smod   rd, rs1, rs2|imm
+  add sub mul and or xor shl shr sar div mod sdiv smod adc sbb   rd, rs1, rs2|imm
         (imm 0..15 uses the short form; anything else, negatives and forward
          label references included, uses a 16-bit immediate: add r1, r1, -1)
   not rd, rs      swap rd, rs     pop rd, rsp     ret rsp
@@ -52,8 +63,8 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
   (id selectors ID_MAX ID_VERSION ID_FEATURES ID_MEMTOP ID_RS0 ID_REGS ID_OPCODES
    ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK are predefined)
   cmp rs1, rs2|imm
-  jmp jn jz jp jnz jle jge  rtarget|addr          (jmp loop)
-  Memory operands: add sub mul and or xor shl shr sar div mod sdiv smod cmp
+  jmp jn jz jp jnz jle jge jc  rtarget|addr          (jmp loop)
+  Memory operands: add sub mul and or xor shl shr sar div mod sdiv smod cmp adc sbb
   accept [reg] for any operand: [rs1]/[rs2] read mem[reg] instead of reg, and a
   bracketed destination [rd] stores the result to mem[rd], e.g.
       add [r2], [r1], 5      ; mem[r2] = mem[r1] + 5
@@ -196,7 +207,8 @@ def need(mn, ops, n):
 PCREL = {'ld': 4, 'ldi': 5, 'st': 7, 'sti': 8, 'lea': 13}
 TRAPS = {'halt': 0, 'putc': 1, 'puts': 2, 'gets': 3, 'ext': 4}
 M1_NAMES = {'nop', 'add', 'and', 'not', 'ldr', 'str', 'jmp', 'jsr', 'jsrr', 'ret',
-            'trap', 'mov', 'clr', 'li', 'enter2'} | set(PCREL) | set(TRAPS)
+            'trap', 'mov', 'clr', 'li', 'enter2',
+            'inc', 'dec', 'neg', 'sub', 'tst', 'shl', 'push', 'pop'} | set(PCREL) | set(TRAPS)
 BR_RE = re.compile(r'^br([nzp]*)$')
 
 
@@ -325,6 +337,66 @@ def enc1(env, mn, ops):
         need(mn, ops, 1)
         return [13 << 12 | 7 << 9 | rel(env, eval_expr(ops[0], env), 9), 15 << 12 | 4 << 8]
 
+    # ---- macros built from the instructions above ----
+    def seq(*calls):
+        out = []
+        for m, o in calls:
+            out += enc1(env, m, o)
+        return out
+
+    if mn in ('inc', 'dec'):            # inc rd | inc rd, rs      (1 word)
+        if len(ops) not in (1, 2):
+            raise AsmError("'%s' takes 1 or 2 operands" % mn)
+        src = ops[1] if len(ops) == 2 else ops[0]
+        return enc1(env, 'add', [ops[0], src, '1' if mn == 'inc' else '-1'])
+
+    if mn == 'neg':                     # neg rd | neg rd, rs      (2 words)
+        if len(ops) not in (1, 2):
+            raise AsmError("'neg' takes 1 or 2 operands")
+        return seq(('not', ops), ('add', [ops[0], '1']))
+
+    if mn == 'tst':                     # set the condition codes from rd   (1 word)
+        need(mn, ops, 1)
+        return enc1(env, 'add', [ops[0], ops[0], '0'])
+
+    if mn == 'shl':                     # shl rd [, n]: rd <<= n by doubling (n words)
+        if len(ops) not in (1, 2):
+            raise AsmError("'shl' takes a register and an optional count")
+        n = eval_expr(ops[1], env, strict=True) if len(ops) == 2 else 1
+        if not 1 <= n <= 16:
+            raise AsmError("shl count must be 1..16 (each shift is one instruction)")
+        return enc1(env, 'add', [ops[0], ops[0], ops[0]]) * n
+
+    if mn == 'sub':                     # sub rd, x | sub rd, rs1, x     (1-3 words)
+        if len(ops) == 2:
+            ops = [ops[0], ops[0], ops[1]]
+        need(mn, ops, 3)
+        rd, rs1 = R(ops[0]), R(ops[1])
+        rs2 = as_reg(ops[2], 7)
+        if rs2 is None:                 # subtract an immediate
+            v = eval_expr(ops[2], env)
+            lo, hi = (-63, 64) if rd == rs1 else (-7, 8)
+            if env.final and not lo <= v <= hi:
+                raise AsmError("sub immediate %d out of range (%d..%d)" % (v, lo, hi))
+            return enc1(env, 'add', [ops[0], ops[1], str(-v)])
+        if rs1 == rs2:
+            return enc1(env, 'clr', [ops[0]])
+        if rd != rs2:                   # rd = ~(~rs1 + rs2)
+            return seq(('not', [ops[0], ops[1]]), ('add', [ops[0], ops[0], ops[2]]),
+                       ('not', [ops[0], ops[0]]))
+        return seq(('not', [ops[0], ops[0]]), ('add', [ops[0], ops[0], ops[1]]),
+                   ('add', [ops[0], '1']))      # rd == rs2: rs1 + ~rs2 + 1
+
+    if mn == 'push':                    # push rsp, rv   (store, then decrement - like mode 2)
+        need(mn, ops, 2)
+        return seq(('str', [ops[1], ops[0], '0']), ('add', [ops[0], '-1']))
+
+    if mn == 'pop':                     # pop rd, rsp    (increment, then load - like mode 2)
+        need(mn, ops, 2)
+        if R(ops[0]) == R(ops[1]):
+            raise AsmError("pop: destination and stack register must differ")
+        return seq(('add', [ops[1], '1']), ('ldr', [ops[0], ops[1], '0']))
+
     raise AsmError("internal: unhandled mode-1 mnemonic '%s'" % mn)
 
 
@@ -342,9 +414,11 @@ M2 = {
     'id': (26, 'rs'), 'shl': (27, 'rrx'), 'shr': (28, 'rrx'), 'sar': (29, 'rrx'),
     'div': (30, 'rrx'), 'mod': (31, 'rrx'), 'cmp': (32, 'cmp'),
     'jnz': (33, 'j'), 'jle': (34, 'j'), 'jge': (35, 'j'),
-    'sdiv': (36, 'rrx'), 'smod': (37, 'rrx'),
+    'sdiv': (36, 'rrx'), 'smod': (37, 'rrx'), 'adc': (38, 'rrx'),
+    'sbb': (39, 'rrx'), 'jc': (40, 'j')
 }
-M2_ALIAS = {'mov': 'move'}
+M2_ALIAS = {'mov': 'move', 'li': 'move'}
+M2_MACROS = {'inc', 'dec', 'neg', 'clr', 'tst'}
 
 
 # ALU instructions accept [reg] memory operands: [dst] -> bit 5, [src1] -> bit 4,
@@ -358,6 +432,9 @@ def enc2(env, mn, ops, cc):
     R = lambda t: reg(t, 15)
     w0 = code << 8 | (0x80 if cc else 0)
     dr = o1 = o2 = 0
+
+    if shape == 'rrx' and len(ops) == 2:        # `add rd, x`  ==  `add rd, rd, x`
+        ops = [ops[0], ops[0], ops[1]]
 
     roles = MEM_ROLES.get(shape, 'd1' if mn == 'not' else '')
     clean = []
@@ -434,6 +511,29 @@ def enc2(env, mn, ops, cc):
         o1 = R(ops[0])
         o2 = reg_or_imm(ops[1])
     return [w0, dr << 12 | o1 << 8 | o2 << 4] + extra
+
+
+def macro2(env, mn, ops, cc):
+    """Mode-2 macros.  `.cc` applies to the instruction that produces the result.
+    Bracketed [reg] memory operands work too: inc [r1], neg [r2], clr [r3]."""
+    if mn in ('inc', 'dec'):                    # inc rd | inc rd, rs
+        if len(ops) not in (1, 2):
+            raise AsmError("'%s' takes 1 or 2 operands" % mn)
+        src = ops[1] if len(ops) == 2 else ops[0]
+        return enc2(env, 'add' if mn == 'inc' else 'sub', [ops[0], src, '1'], cc)
+    if mn == 'neg':                             # neg rd | neg rd, rs   (not; add 1)
+        if len(ops) not in (1, 2):
+            raise AsmError("'neg' takes 1 or 2 operands")
+        src = ops[1] if len(ops) == 2 else ops[0]
+        return (enc2(env, 'not', [ops[0], src], False) +
+                enc2(env, 'add', [ops[0], ops[0], '1'], cc))
+    if mn == 'clr':                             # clr rd  (rd = rd ^ rd)
+        need(mn, ops, 1)
+        return enc2(env, 'xor', [ops[0]] * 3, cc)
+    if mn == 'tst':                             # tst rd  (cmp rd, 0)
+        need(mn, ops, 1)
+        return enc2(env, 'cmp', [ops[0], '0'], False)
+    raise AsmError("internal: unhandled mode-2 macro '%s'" % mn)
 
 
 # --------------------------------------------------------------------------
@@ -636,6 +736,8 @@ def process(env, it):
         if M2_ALIAS.get(base, base) in M2:
             raise AsmError("'%s' is a mode-2 instruction; switch with `.mode 2`" % base)
     else:
+        if base in M2_MACROS:
+            return macro2(env, base, ops, bool(suf))
         b = M2_ALIAS.get(base, base)
         if b in M2:
             return enc2(env, b, ops, bool(suf))

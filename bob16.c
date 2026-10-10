@@ -24,7 +24,7 @@ typedef uint16_t word;
 enum { NOP, ADD, AND, NOT, LD, LDI, LDR, ST, STI, STR,
        BR, JMP, JSR, LEA, RET, TRAP };
 enum { T_HALT, T_PUTC, T_PUTS, T_GETS, T_EXT };
-enum { N, Z, P };
+enum { N, Z, P, C };
 enum { I2_NOP, I2_HALT, I2_UEXT, I2_ADD,
        I2_SUB, I2_MUL, I2_AND, I2_OR,
        I2_NOT, I2_XOR, I2_JMP, I2_JN,
@@ -34,7 +34,8 @@ enum { I2_NOP, I2_HALT, I2_UEXT, I2_ADD,
        I2_CALL, I2_RET, I2_ID, I2_SHL,
        I2_SHR, I2_SAR, I2_DIV, I2_MOD,
        I2_CMP, I2_JNZ, I2_JLE, I2_JGE,
-       I2_SDIV, I2_SMOD };
+       I2_SDIV, I2_SMOD, I2_ADC, I2_SBB,
+       I2_JC };
 
 /* id selectors (cpuid-like): `id rd, sel` puts the answer for `sel` in rd.
  * Unknown selectors return 0; ID_MAX returns the highest valid selector. */
@@ -66,7 +67,7 @@ static struct {
     word ir;
     word pc;
     word rs0;
-    bool cc[3];
+    bool cc[4];
 } cpu;
 
 static word mem[MEM_WORDS];
@@ -337,14 +338,17 @@ static void step2(void) {
         case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
         case I2_XOR: case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
         case I2_MOD: case I2_CMP: case I2_SDIV: case I2_SMOD:
+        case I2_ADC: case I2_SBB:
             if (i2) bad(at0);        /* i2 and i3 are mutually exclusive */
             break;
         case I2_JMP: case I2_JN: case I2_JZ: case I2_JP:
         case I2_JNZ: case I2_JLE: case I2_JGE:
-        case I2_UEXT:                    /* target replaces r[dr] */
+        case I2_UEXT: case I2_JC:
+        /* target replaces r[dr] */
         case I2_LOAD: case I2_LOAD2: case I2_STOR: case I2_STOR2:
         case I2_IN: case I2_OUT: case I2_PUSH: case I2_MOVE:
-        case I2_CALL: case I2_ID:        /* immediate replaces r[or1] */
+        case I2_CALL: case I2_ID:
+        /* immediate replaces r[or1] */
             break;
         default:
             bad(at0);
@@ -371,6 +375,7 @@ static void step2(void) {
     case I2_ADD: {
         alu_pre;
         r = a + b;
+        if (icc) cpu.cc[C] = r < a;
         alu_post;
         break;
     }
@@ -378,6 +383,7 @@ static void step2(void) {
     case I2_SUB: {
         alu_pre;
         r = a - b;
+        if (icc) cpu.cc[C] = b > a;
         alu_post;
         break;
     }
@@ -567,7 +573,7 @@ static void step2(void) {
         case ID_MEMTOP:   v = (word)(MEM_WORDS - 1); break;
         case ID_RS0:      v = cpu.rs0; break;
         case ID_REGS:     v = (8 << 8) | 16; break;
-        case ID_OPCODES:  v = I2_SMOD + 1; break;
+        case ID_OPCODES:  v = I2_JC + 1; break;
         case ID_PORTS:    v = PORTF_IO | PORTF_TIME; break;
         case ID_NAME0:    v = ('B' << 8) | 'O'; break;
         case ID_NAME1:    v = ('B' << 8) | '-'; break;
@@ -661,6 +667,29 @@ static void step2(void) {
         }
         r = (word)((int16_t)a % (int16_t)b);
         alu_post;
+        break;
+    }
+
+    case I2_ADC: {
+        alu_pre;
+        uint32_t t = (uint32_t)a + b + cpu.cc[C];   /* a + b + carry-in */
+        r = (word)t;
+        if (icc) cpu.cc[C] = t > 0xFFFF;            /* carry-out */
+        alu_post;
+        break;
+    }
+
+    case I2_SBB: {
+        alu_pre;
+        uint32_t bw = (uint32_t)b + cpu.cc[C];      /* b + borrow-in */
+        r = (word)(a - bw);
+        if (icc) cpu.cc[C] = bw > a;                /* borrow-out */
+        alu_post;
+        break;
+    }
+
+    case I2_JC: {
+        if (cpu.cc[C]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
         break;
     }
 
