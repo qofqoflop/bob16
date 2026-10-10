@@ -85,8 +85,10 @@ programs out of the libc-reserved upper half. `bobc` programs build with it:
 `bobc.py` compiles a C-like subset (`int`/`unsigned`/`char`/`half`/`void`, globals,
 functions with params/calls/recursion, arrays + pointers, `if`/`while`/
 `do`/`for`/`return`/`break`/`continue`, full C expression precedence,
-`puts`/`putc`/`print_int`; see `example/hello.b`, `example/fib.b`,
-`example/funcs.b`, `example/half.b`, `example/uselib.b` + `example/mathlib.b`).
+`puts`/`putc`/`print_int`/`gettime`/`settime` (64-bit virtual time <->
+four words at an address); see `example/hello.b`, `example/fib.b`,
+`example/funcs.b`, `example/half.b`, `example/time.b`,
+`example/uselib.b` + `example/mathlib.b`).
 Args go right-to-left on the stack
 (`r10` = SP, `r11` = FP, result in `r0`, caller cleans up). `half` is IEEE
 binary16 (`1.5h` literals, `fdiv` never traps, `ftoi` traps out of range /

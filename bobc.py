@@ -15,6 +15,7 @@ M2 subset:
   expressions:  full C precedence, = += ... ?:  && || ! ~ - * & [] () calls,
                 sizeof, numbers, 'c', "str" (builtins take strings)
   builtins (statements only): puts(e)  putc(e)  print_int(e)
+  gettime(e)/settime(e) (64-bit virtual time <-> four words at e)
 
 M3 adds: `half` (IEEE binary16) variables/globals/params/returns, `h`
   literals (`1.5h 2h infh nanh`), mixed int/half arithmetic (int promotes
@@ -1220,7 +1221,7 @@ class Parser:
             if self.at('{'):
                 return Defer(self.parse_block())
             if self.at('id') and self.toks[self.pos + 1].text == '(':
-                if self.peek().text in ('puts', 'putc', 'print_int'):
+                if self.peek().text in ('puts', 'putc', 'print_int', 'gettime', 'settime'):
                     b = self.parse_builtin()
                     self.expect(';')
                     return Defer(ExprStmt(b))
@@ -1243,7 +1244,7 @@ class Parser:
             self.expect(';')
             return Continue()
         if self.at('id') and self.toks[self.pos + 1].text == '(':
-            if self.peek().text in ('puts', 'putc', 'print_int'):
+            if self.peek().text in ('puts', 'putc', 'print_int', 'gettime', 'settime'):
                 b = self.parse_builtin()
                 self.expect(';')
                 return ExprStmt(b)
@@ -1259,7 +1260,7 @@ class Parser:
 
     def parse_builtin(self):
         name = self.next().text
-        if name not in ('puts', 'putc', 'print_int'):
+        if name not in ('puts', 'putc', 'print_int', 'gettime', 'settime'):
             raise self.fail("unknown function '%s'" % name)
         self.expect('(')
         args = []
@@ -2748,7 +2749,39 @@ class Gen:
             self.emit('jmp %s' % lo)
             self.emit('%s:' % ld)
             return
+        if b.name == 'gettime':
+            # 64-bit virtual time -> four words at the address in r0
+            if len(b.args) != 1:
+                raise self.fail("gettime takes 1 argument")
+            self.gen_time_addr(b)
+            for i in range(4):
+                self.emit('in r1, 0x%X' % (0x70 + i))
+                self.emit('stor r0+%d, r1' % i if i else 'stor r0, r1')
+            return
+        if b.name == 'settime':
+            # four words at the address in r0 -> 64-bit virtual time
+            if len(b.args) != 1:
+                raise self.fail("settime takes 1 argument")
+            self.gen_time_addr(b)
+            self.emit('move r2, 0x70')
+            for i in range(4):
+                self.emit('load r1, r0+%d' % i if i else 'load r1, r0')
+                self.emit('out r2, r1')
+                if i < 3:
+                    self.emit('inc r2')
+            return
         raise self.fail("unknown builtin '%s'" % b.name)
+
+    def gen_time_addr(self, b):
+        """evaluate a gettime/settime address argument into r0."""
+        a = b.args[0]
+        if isinstance(a, Str):
+            lab = self.intern_str(a.raw)
+            self.emit('move r0, %s' % lab)
+        else:
+            if self.rtype(a) == 'half':
+                raise self.fail("%s needs an address, not half" % b.name)
+            self.gen(a)
 
     # ---- program ----
     def generate(self, globals_, funcs, main):
@@ -2869,7 +2902,7 @@ class Gen:
         self.emit('halt' if fd.name == 'main' else 'ret r10')
 
     def gen_call(self, name, args, want_value):
-        if name in ('puts', 'putc', 'print_int'):
+        if name in ('puts', 'putc', 'print_int', 'gettime', 'settime'):
             raise self.fail("'%s' is a statement-only builtin in M2" % name)
         if name not in self.funcs:
             raise self.fail("undefined function '%s'" % name)
