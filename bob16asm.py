@@ -61,7 +61,7 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
   in rd, rport|imm      out rport, rval|imm    id rd, rsel|imm
   push rsp, rval|imm    call rsp, rtarget|imm
   (id selectors ID_MAX ID_VERSION ID_FEATURES ID_MEMTOP ID_RS0 ID_REGS ID_OPCODES
-   ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK are predefined)
+   ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK/OFF are predefined)
   cmp rs1, rs2|imm
   jmp jn jz jp jnz jle jge jc  rtarget|addr          (jmp loop)
   Memory operands: add sub mul and or xor shl shr sar div mod sdiv smod cmp adc sbb
@@ -70,6 +70,15 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
       add [r2], [r1], 5      ; mem[r2] = mem[r1] + 5
       add r4, r3, [0x2000]   ; absolute read: r4 = r3 + mem[0x2000]
       cmp [r1], [r2]
+  Offsets (flag i4/i5, FEAT_OFF): append +off/-off (-255..255, shared sign)
+  to a register base; src uses the low byte, dst the high byte, e.g.
+      add r3, r1+5, r2       ; r3 = (r1+5) + r2
+      add [r4+0x10], r1, r2  ; mem[r4+0x10] = r1 + r2
+      load r1, r2+5          ; r1 = mem[r2+5]
+      stor r4+0x10, r1+5     ; mem[r4+0x10] = r1+5
+      jmp r1+5               ; pc = r1+5       (ret rsp+off cleans the stack)
+      out r3+1, r1+5         ; port r3+1 gets r1+5
+  No offset on the last ALU operand (`add r1, r2, r3+1` is rejected).
 """
 import argparse
 import ast
@@ -427,19 +436,53 @@ MEM_BIT = {'d': 0x20, '1': 0x10, '2': 0x08}
 MEM_ROLES = {'rrx': 'd12', 'cmp': '12'}
 
 
+REG_OFF_RE = re.compile(r'^\s*(r\d+|lr)\s*([+-])\s*(.+?)\s*$', re.I)
+
+
+def split_reg_off(tok, maxreg, env):
+    """Split `rN +/- expr` into (reg, signed_offset). None if not reg-based."""
+    m = REG_OFF_RE.match(tok)
+    if not m:
+        return None
+    r = as_reg(m.group(1), maxreg)
+    if r is None:
+        return None
+    v = eval_expr('%s(%s)' % (m.group(2), m.group(3)), env)
+    return (r, v)
+
+
 def enc2(env, mn, ops, cc):
     code, shape = M2[mn]
     R = lambda t: reg(t, 15)
     w0 = code << 8 | (0x80 if cc else 0)
     dr = o1 = o2 = 0
+    soff = doff = None      # signed offsets for or1 (low) / dr (high)
+
+    def set_soff(v):
+        nonlocal soff
+        if soff is not None:
+            raise AsmError("duplicate source offset")
+        soff = v
+
+    def set_doff(v):
+        nonlocal doff
+        if doff is not None:
+            raise AsmError("duplicate destination offset")
+        doff = v
+
+    def no_off(tok, what):
+        if split_reg_off(tok, 15, env) is not None:
+            raise AsmError("offsets not allowed on %s" % what)
+        return R(tok)
 
     if shape == 'rrx' and len(ops) == 2:        # `add rd, x`  ==  `add rd, rd, x`
         ops = [ops[0], ops[0], ops[1]]
 
     roles = MEM_ROLES.get(shape, 'd1' if mn == 'not' else '')
-    clean = []
+    bases, mems = [], []
     for i, o in enumerate(ops):
         t = o.strip()
+        is_mem = False
         if t.startswith('['):
             if not t.endswith(']'):
                 raise AsmError("missing ']'")
@@ -447,8 +490,10 @@ def enc2(env, mn, ops, cc):
                 raise AsmError("'%s' has no memory-operand form for operand %d" % (mn, i + 1))
             w0 |= MEM_BIT[roles[i]]
             t = t[1:-1].strip()
-        clean.append(t)
-    ops = clean
+            is_mem = True
+        bases.append(t)
+        mems.append(is_mem)
+    ops = bases
 
     extra = []           # the optional third word (16-bit immediate, flag i3)
 
@@ -481,35 +526,122 @@ def enc2(env, mn, ops, cc):
 
     if shape == 'none':
         need(mn, ops, 0)
-    elif shape == 'r':
+    elif shape == 'r':                        # ret: dr is SP, +off = post-adjust
         need(mn, ops, 1)
-        dr = R(ops[0])
-    elif shape == 'j':                      # jump target: register or 16-bit address
-        need(mn, ops, 1)
-        r = as_reg(ops[0], 15)
-        if r is not None:
-            dr = r
+        ro = split_reg_off(ops[0], 15, env)
+        dr = ro[0] if ro is not None else R(ops[0])
+        if ro is not None:
+            set_doff(ro[1])
+    elif shape == 'j':                        # jump target: register or 16-bit address
+        need(mn, ops, 1)                      # `jmp r1+5` uses high byte; imm folds
+        ro = split_reg_off(ops[0], 15, env)
+        if ro is not None:
+            dr = ro[0]
+            set_doff(ro[1])
         else:
-            imm16(ops[0])
+            r = as_reg(ops[0], 15)
+            if r is not None:
+                dr = r
+            else:
+                imm16(ops[0])
     elif shape == 'rr':
         need(mn, ops, 2)
-        dr, o1 = R(ops[0]), R(ops[1])
+        if mn == 'swap':                      # both sides take offsets
+            ro0 = split_reg_off(ops[0], 15, env)
+            ro1 = split_reg_off(ops[1], 15, env)
+            dr = ro0[0] if ro0 is not None else R(ops[0])
+            o1 = ro1[0] if ro1 is not None else R(ops[1])
+            if ro0 is not None:
+                set_doff(ro0[1])
+            if ro1 is not None:
+                set_soff(ro1[1])
+        elif mn == 'pop':                     # `pop rd, rsp+off` peeks ahead
+            dr = no_off(ops[0], "destination")
+            ro = split_reg_off(ops[1], 15, env)
+            if ro is not None:
+                o1 = ro[0]
+                set_soff(ro[1])
+            else:
+                o1 = R(ops[1])
+        else:                                 # not: `not rd, rs+off`, `[rd+off]`
+            if mems[0]:
+                ro = split_reg_off(ops[0], 15, env)
+                if ro is not None:
+                    dr = ro[0]
+                    set_doff(ro[1])
+                else:
+                    dr = R(ops[0])
+            else:
+                dr = no_off(ops[0], "destination")
+            ro = split_reg_off(ops[1], 15, env)
+            if ro is not None:
+                o1 = ro[0]
+                set_soff(ro[1])
+            else:
+                o1 = R(ops[1])
     elif shape == 'rs':                     # second operand: register or 16-bit immediate
         need(mn, ops, 2)
-        dr = R(ops[0])
-        r = as_reg(ops[1], 15)
-        if r is not None:
-            o1 = r
+        if mn in ('stor', 'stor2', 'out'):
+            ro = split_reg_off(ops[0], 15, env)   # address/port offset (high)
+            if ro is not None:
+                dr = ro[0]
+                set_doff(ro[1])
+            else:
+                dr = R(ops[0])
+        else:                                 # dest is a plain register
+            dr = no_off(ops[0], "destination")
+        ro = split_reg_off(ops[1], 15, env)       # value/port/target offset (low)
+        if ro is not None:
+            o1 = ro[0]
+            set_soff(ro[1])
         else:
-            imm16(ops[1])
+            r = as_reg(ops[1], 15)
+            if r is not None:
+                o1 = r
+            else:
+                imm16(ops[1])
     elif shape == 'rrx':
         need(mn, ops, 3)
-        dr, o1 = R(ops[0]), R(ops[1])
+        if mems[0]:                           # `[rd+off]` destination offset
+            ro = split_reg_off(ops[0], 15, env)
+            if ro is not None:
+                dr = ro[0]
+                set_doff(ro[1])
+            else:
+                dr = R(ops[0])
+        else:
+            dr = no_off(ops[0], "destination")
+        ro = split_reg_off(ops[1], 15, env)       # src1 value or [mem] offset
+        if ro is not None:
+            o1 = ro[0]
+            set_soff(ro[1])
+        else:
+            o1 = R(ops[1])
+        if split_reg_off(ops[2], 15, env) is not None:
+            raise AsmError("offsets not allowed on the third operand")
         o2 = reg_or_imm(ops[2])
     elif shape == 'cmp':
         need(mn, ops, 2)
-        o1 = R(ops[0])
+        ro = split_reg_off(ops[0], 15, env)
+        if ro is not None:
+            o1 = ro[0]
+            set_soff(ro[1])
+        else:
+            o1 = R(ops[0])
+        if split_reg_off(ops[1], 15, env) is not None:
+            raise AsmError("offsets not allowed on the second operand")
         o2 = reg_or_imm(ops[1])
+    if soff is not None or doff is not None:
+        s, d = soff or 0, doff or 0
+        if env.final:
+            for v, what in ((s, "source"), (d, "destination")):
+                if not -255 <= v <= 255:
+                    raise AsmError("%s offset %d out of range (-255..255)" % (what, v))
+        if (s > 0 or d > 0) and (s < 0 or d < 0):
+            raise AsmError("mixed + and - offsets need the same sign (shared i5)")
+        neg = s < 0 or d < 0
+        w0 |= 0x02 | (0x01 if neg else 0)
+        extra.append(((abs(d) << 8) | abs(s)) & 0xFFFF)
     return [w0, dr << 12 | o1 << 8 | o2 << 4] + extra
 
 
@@ -782,6 +914,7 @@ BUILTINS = {
     'ID_REGS': 5, 'ID_OPCODES': 6, 'ID_PORTS': 7,
     'ID_NAME0': 8, 'ID_NAME1': 9, 'ID_NAME2': 10,
     'FEAT_MEMOPS': 1, 'FEAT_IMM16': 2, 'FEAT_SDIV': 4, 'FEAT_IO': 8, 'FEAT_STACK': 16,
+    'FEAT_OFF': 32,
 }
 
 

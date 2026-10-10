@@ -55,12 +55,13 @@ enum { FEAT_MEMOPS = 1 << 0,   /* [reg] memory operands on ALU instructions */
        FEAT_IMM16  = 1 << 1,   /* i3: 16-bit immediate third word */
        FEAT_SDIV   = 1 << 2,   /* signed sdiv / smod */
        FEAT_IO     = 1 << 3,   /* in / out */
-       FEAT_STACK  = 1 << 4 }; /* push / pop / call / ret */
+       FEAT_STACK  = 1 << 4,   /* push / pop / call / ret */
+       FEAT_OFF    = 1 << 5 }; /* i4/i5: 8-bit offsets on ALU src/dst */
 
 enum { PORTF_IO   = 1 << 0,
        PORTF_TIME = 1 << 1 };
 
-#define BOB16_VERSION 0x0100   /* 1.0 */
+#define BOB16_VERSION 0x0101   /* 1.1: i4/i5 offsets */
 
 static struct {
     word r[16];
@@ -294,8 +295,13 @@ static void step1(void) {
     }
 }
 
-#define alu_src word a, b; \
+#define alu_src word a, b, tmp, tmp2; \
                 a = cpu.r[or1]; \
+                if (i4) { \
+                    tmp = mem[i3 ? at3 : at2] & 0xFF; \
+                    if (i5) a -= tmp; \
+                    else a += tmp; \
+                } \
                 b = i2 ? or2 : i3 ? mem[at2] : cpu.r[or2]; \
                 if (imem1) a = mem[a]; \
                 if (imem2) b = mem[b]
@@ -303,11 +309,23 @@ static void step1(void) {
 #define alu_pre word r; alu_src
 
 /* With i3 set, the third word replaces the or1 operand of non-ALU
- * instructions (move/load/stor/in/out/push/call/id) */
-#define or1v (i3 ? mem[at2] : cpu.r[or1])
+ * instructions (move/load/stor/in/out/push/call/id).
+ * With i4 set, low offset byte adjusts or1 (src) and high adjusts dr (dst),
+ * sharing sign i5. ALU uses alu_src/alu_post; others use or1v/droff/jmpv. */
+#define or1vb (i3 ? mem[at2] : cpu.r[or1])
+#define or1v (i4 ? (i5 ? (word)(or1vb - soff) : (word)(or1vb + soff)) : or1vb)
+#define droff (i4 ? (i5 ? (word)(cpu.r[dr] - doff) : (word)(cpu.r[dr] + doff)) : cpu.r[dr])
+#define jmpb (i3 ? mem[at2] : cpu.r[dr])
+#define jmpv (i4 ? (i5 ? (word)(jmpb - doff) : (word)(jmpb + doff)) : jmpb)
 
 #define alu_post if (icc) set_cc(r); \
-                 if (imemd) mem[cpu.r[dr]] = r; \
+                 tmp2 = cpu.r[dr]; \
+                 if (i4) { \
+                    tmp = (mem[i3 ? at3 : at2] >> 8) & 0xFF; \
+                    if (i5) tmp2 -= tmp; \
+                    else tmp2 += tmp; \
+                 } \
+                 if (imemd) mem[tmp2] = r; \
                  else cpu.r[dr] = r
 
 static void step2(void) {
@@ -321,13 +339,21 @@ static void step2(void) {
     word imem1 = (mem[at0] >> 4) & 0x1;
     word imem2 = (mem[at0] >> 3) & 0x1;
     word i3 = (mem[at0] >> 2) & 0x1;
+    word i4 = (mem[at0] >> 1) & 0x1;
+    word i5 = mem[at0] & 0x1;
 
     word dr = (mem[at1] >> 12) & 0xF;
     word or1 = (mem[at1] >> 8) & 0xF;
     word or2 = (mem[at1] >> 4) & 0xF;
 
     word at2 = at1 + 1;
+    word at3 = at2 + 1;
+
     word opc = (mem[at0] >> 8) & 0xFF;
+
+    word offw = i4 ? mem[i3 ? at3 : at2] : 0;
+    word soff = offw & 0xFF;
+    word doff = (offw >> 8) & 0xFF;
 
     int64_t timet;
 
@@ -355,6 +381,50 @@ static void step2(void) {
         }
         cpu.pc++;
     }
+    if (i5 && !i4) bad(at0);      /* sign without offset word */
+    if (i4) {
+        /* i4 = extra offset word (low = or1/src off, high = dr/dst off, sign i5).
+         * Unused half must be zero so silent ignores trap. */
+        switch (opc) {
+        case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
+        case I2_XOR: case I2_NOT:
+        case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
+        case I2_MOD: case I2_SDIV: case I2_SMOD:
+        case I2_ADC: case I2_SBB:
+            if (!imemd && doff != 0) bad(at0);
+            break;
+        case I2_CMP:
+        case I2_LOAD: case I2_LOAD2: case I2_MOVE: case I2_ID:
+        case I2_IN: case I2_PUSH: case I2_CALL:
+            if (doff != 0) bad(at0);
+            break;
+        case I2_STOR: case I2_STOR2: case I2_OUT: case I2_SWAP:
+            break;                  /* both halves used */
+        case I2_JMP: case I2_JN: case I2_JZ: case I2_JP:
+        case I2_JNZ: case I2_JLE: case I2_JGE: case I2_JC:
+        case I2_UEXT: case I2_RET:
+            if (soff != 0) bad(at0);
+            break;
+        case I2_POP:
+            if (doff != 0) bad(at0);
+            break;
+        default:                    /* NOP, HALT */
+            bad(at0);
+        }
+    }
+    /* non-ALU ops must not carry ALU-only mem/i2 flags */
+    switch (opc) {
+    case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
+    case I2_XOR: case I2_NOT:
+    case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
+    case I2_MOD: case I2_CMP: case I2_SDIV: case I2_SMOD:
+    case I2_ADC: case I2_SBB:
+        break;
+    default:
+        if (i2 || imemd || imem1 || imem2) bad(at0);
+        break;
+    }
+    if (i4) cpu.pc++;
 
     switch (opc) {
     case I2_NOP: {
@@ -368,7 +438,7 @@ static void step2(void) {
 
     case I2_UEXT: {
         cpu.rs0 = cpu.rs0 & 0xFFFE;
-        cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        cpu.pc = jmpv;
         break;
     }
 
@@ -424,22 +494,22 @@ static void step2(void) {
     }
 
     case I2_JMP: {
-        cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        cpu.pc = jmpv;
         break;
     }
 
     case I2_JN: {
-        if (cpu.cc[N]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[N]) cpu.pc = jmpv;
         break;
     }
 
     case I2_JZ: {
-        if (cpu.cc[Z]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[Z]) cpu.pc = jmpv;
         break;
     }
 
     case I2_JP: {
-        if (cpu.cc[P]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[P]) cpu.pc = jmpv;
         break;
     }
 
@@ -456,13 +526,13 @@ static void step2(void) {
     }
 
     case I2_STOR: {
-        mem[cpu.r[dr]] = or1v;
+        mem[droff] = or1v;
         if (icc) set_cc(or1v);
         break;
     }
 
     case I2_STOR2: {
-        mem[mem[cpu.r[dr]]] = or1v;
+        mem[mem[droff]] = or1v;
         if (icc) set_cc(or1v);
         break;
     }
@@ -493,7 +563,7 @@ static void step2(void) {
     }
 
     case I2_OUT: {
-        switch (cpu.r[dr]) {
+        switch (droff) {
         case 0x0:
             putchar((char)or1v);
             break;
@@ -533,7 +603,11 @@ static void step2(void) {
     }
 
     case I2_POP: {
-        cpu.r[dr] = mem[++cpu.r[or1]];
+        word sp = cpu.r[or1];
+        word addr = i4 ? (i5 ? (word)(sp + 1 - soff) : (word)(sp + 1 + soff))
+                       : (word)(sp + 1);
+        cpu.r[dr] = mem[addr];
+        cpu.r[or1] = (word)(sp + 1);
         if (icc) set_cc(cpu.r[dr]);
         break;
     }
@@ -545,21 +619,23 @@ static void step2(void) {
     }
 
     case I2_SWAP: {
-        word t = cpu.r[dr];
-        cpu.r[dr] = cpu.r[or1];
+        word t = droff;
+        cpu.r[dr] = or1v;
         cpu.r[or1] = t;
         if (icc) set_cc(cpu.r[dr]);
         break;
     }
 
     case I2_CALL: {
-        mem[cpu.r[dr]--] = cpu.pc;      /* pc already points past the i3 word */
+        mem[cpu.r[dr]--] = cpu.pc;      /* pc already points past i3/i4 words */
         cpu.pc = or1v;
         break;
     }
 
     case I2_RET: {
-        cpu.pc = mem[++cpu.r[dr]];
+        word sp = (word)(cpu.r[dr] + 1);
+        cpu.pc = mem[sp];
+        cpu.r[dr] = i4 ? (i5 ? (word)(sp - doff) : (word)(sp + doff)) : sp;
         break;
     }
 
@@ -569,7 +645,7 @@ static void step2(void) {
         case ID_MAX:      v = ID_NAME2; break;
         case ID_VERSION:  v = BOB16_VERSION; break;
         case ID_FEATURES: v = FEAT_MEMOPS | FEAT_IMM16 | FEAT_SDIV |
-                              FEAT_IO | FEAT_STACK; break;
+                              FEAT_IO | FEAT_STACK | FEAT_OFF; break;
         case ID_MEMTOP:   v = (word)(MEM_WORDS - 1); break;
         case ID_RS0:      v = cpu.rs0; break;
         case ID_REGS:     v = (8 << 8) | 16; break;
@@ -636,17 +712,17 @@ static void step2(void) {
     }
 
     case I2_JNZ: {
-        if (cpu.cc[N] || cpu.cc[P]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[N] || cpu.cc[P]) cpu.pc = jmpv;
         break;
     }
 
     case I2_JLE: {   /* N or Z */
-        if (cpu.cc[N] || cpu.cc[Z]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[N] || cpu.cc[Z]) cpu.pc = jmpv;
         break;
     }
 
     case I2_JGE: {   /* Z or P */
-        if (cpu.cc[Z] || cpu.cc[P]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[Z] || cpu.cc[P]) cpu.pc = jmpv;
         break;
     }
 
@@ -689,7 +765,7 @@ static void step2(void) {
     }
 
     case I2_JC: {
-        if (cpu.cc[C]) cpu.pc = i3 ? mem[at2] : cpu.r[dr];
+        if (cpu.cc[C]) cpu.pc = jmpv;
         break;
     }
 
