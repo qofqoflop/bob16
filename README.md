@@ -60,7 +60,8 @@ bob16asm.py prog.asm [-o prog.bin] [-l prog.lst] [--big-endian]
 ```
 
 Two passes with labels, `+ - * / % << >> & | ^ ~ ( )` expressions, `$`
-(address of the current line), registers `r0..r15` / `lr = r7`, and
+(address of the current line), registers `r0..r15` / `lr = r7`, binary16
+literals (`1.5h -2.0h infh nanh`), and
 directives `.org .mode .word .string/.asciz/.ascii .fill/.space/.blkw
 .equ` (also `NAME = expr`). `ID_*` selectors and `FEAT_*` mask bits are
 predefined. Mode-1 and mode-2 instructions are cross-checked

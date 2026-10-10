@@ -11,6 +11,7 @@ SYNTAX
   label:  mnemonic  op, op, op     ; comment   (also // comments)
   Registers: r0..r7 (mode 1), r0..r15 (mode 2); lr = r7
   Numbers:   42  #42  -5  0x2A  0b101  'a'  '\\n'      ($ = address of this line)
+  Half literals (binary16 bits): 1.5h  -2.0h  0.5h  infh  -infh  nanh
   Expressions: + - * / % << >> & | ^ ~ ( ) with labels and .equ symbols
 
 DIRECTIVES
@@ -68,6 +69,8 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
   (id selectors ID_MAX ID_VERSION ID_FEATURES ID_MEMTOP ID_RS0 ID_REGS ID_OPCODES
    ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK/OFF/EXTALU/MEMB/STACK2/JX are predefined)
   cmp rs1, rs2|imm   tst rs1, rs2|imm   btst rs1, bit
+  fadd fsub fmul fdiv   rd, rs1, rs2|imm    (binary16 IEEE 754 half)
+  fcmp rs1, rs2|imm   itof rd, rs   ftoi rd, rs
   jmp jn jz jp jnz jle jge jc jnc  rtarget|addr          (jmp loop)
   Memory operands: add sub mul and or xor shl shr sar div mod sdiv smod cmp adc sbb
   accept [reg] for any operand: [rs1]/[rs2] read mem[reg] instead of reg, and a
@@ -89,11 +92,57 @@ import argparse
 import ast
 import operator
 import re
+import struct
 import sys
 
 
 class AsmError(Exception):
     pass
+
+
+def _f2h_bits(f):
+    """binary32 float -> binary16 bits, round-to-nearest-even (mirrors bob16.c)."""
+    u = struct.unpack('<I', struct.pack('<f', f))[0]
+    s = (u >> 31) & 1
+    if (u & 0x7FFFFFFF) >= 0x7F800000:
+        h = 0x7E00 if (u & 0x7FFFFF) else 0x7C00
+    else:
+        e = ((u >> 23) & 0xFF) - 127
+        m = u & 0x7FFFFF
+        if e >= 16:
+            h = 0x7C00
+        elif e >= -14:
+            drop = m & 0x1FFF
+            h = ((e + 15) << 10) | (m >> 13)
+            if drop > 0x1000 or (drop == 0x1000 and (h & 1)):
+                h += 1
+        elif e >= -24:
+            mm = m | 0x800000
+            sh = -(e + 1)
+            span = 1 << sh
+            rem = mm & (span - 1)
+            q = mm >> sh
+            if rem > (span >> 1) or (rem == (span >> 1) and (q & 1)):
+                q += 1
+            h = 0x0400 if q >= 1024 else q
+        else:
+            h = 0
+    return (s << 15) | h
+
+
+HALF_RE = re.compile(r'''(?<![\w.)])([+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)h(?![\w])''')
+HALF_NN_RE = re.compile(r'''(?<![\w.)])([+-]?(?:inf(?:inity)?|nan))h(?![\w])''', re.I)
+
+
+def _half_sub(m):
+    return str(_f2h_bits(float(m.group(1))))
+
+
+def _half_nn_sub(m):
+    s = m.group(1)
+    neg = s.startswith('-')
+    return str((0x7E00 if s.lstrip('+-').lower().startswith('nan') else 0x7C00) |
+               (0x8000 if neg else 0))
 
 
 # --------------------------------------------------------------------------
@@ -134,6 +183,8 @@ def eval_expr(text, env, strict=False):
         raise AsmError("missing operand")
     s = re.sub(r"'(\\.|[^\\'])'", _char_sub, s)
     s = s.replace('#', '').replace('$', '__here__')
+    s = HALF_NN_RE.sub(_half_nn_sub, s)
+    s = HALF_RE.sub(_half_sub, s)
     s = re.sub(r'(?<!/)/(?!/)', '//', s)
     try:
         tree = ast.parse(s, mode='eval')
@@ -435,7 +486,10 @@ M2 = {
     'rol': (47, 'rrx'), 'ror': (48, 'rrx'), 'rcr': (49, 'rrx'),
     'bset': (50, 'rrx'), 'bclr': (51, 'rrx'), 'btst': (52, 'cmp'),
     'ldb': (53, 'rs'), 'stb': (54, 'rs'), 'peek': (55, 'rs'),
-    'pushm': (56, 'rs'), 'popm': (57, 'rs'), 'jal': (58, 'rs')
+    'pushm': (56, 'rs'), 'popm': (57, 'rs'), 'jal': (58, 'rs'),
+    'fadd': (59, 'rrx'), 'fsub': (60, 'rrx'), 'fmul': (61, 'rrx'),
+    'fdiv': (62, 'rrx'), 'fcmp': (63, 'cmp'), 'itof': (64, 'rr'),
+    'ftoi': (65, 'rr')
 }
 M2_ALIAS = {'mov': 'move', 'li': 'move'}
 M2_MACROS = {'inc', 'dec', 'clr'}
@@ -489,7 +543,7 @@ def enc2(env, mn, ops, cc):
     if shape == 'rrx' and len(ops) == 2:        # `add rd, x`  ==  `add rd, rd, x`
         ops = [ops[0], ops[0], ops[1]]
 
-    roles = MEM_ROLES.get(shape, 'd1' if mn in ('not', 'neg') else '')
+    roles = MEM_ROLES.get(shape, 'd1' if mn in ('not', 'neg', 'itof', 'ftoi') else '')
     bases, mems = [], []
     for i, o in enumerate(ops):
         t = o.strip()
@@ -576,7 +630,7 @@ def enc2(env, mn, ops, cc):
                 set_soff(ro[1])
             else:
                 o1 = R(ops[1])
-        else:                                 # not/neg: `not rd, rs+off`, `[rd+off]`
+        else:                                 # not/neg/itof/ftoi
             if mems[0]:
                 ro = split_reg_off(ops[0], 15, env)
                 if ro is not None:
@@ -935,7 +989,7 @@ BUILTINS = {
     'ID_NAME0': 8, 'ID_NAME1': 9, 'ID_NAME2': 10,
     'FEAT_MEMOPS': 1, 'FEAT_IMM16': 2, 'FEAT_SDIV': 4, 'FEAT_IO': 8, 'FEAT_STACK': 16,
     'FEAT_OFF': 32, 'FEAT_EXTALU': 64, 'FEAT_MEMB': 128, 'FEAT_STACK2': 256,
-    'FEAT_JX': 512,
+    'FEAT_JX': 512, 'FEAT_FP': 1024,
 }
 
 

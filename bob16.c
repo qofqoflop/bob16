@@ -39,7 +39,9 @@ enum { I2_NOP, I2_HALT, I2_UEXT, I2_ADD,
        I2_MULH, I2_MULHS, I2_DIVMOD, I2_ROL,
        I2_ROR, I2_RCR, I2_BSET, I2_BCLR,
        I2_BTST, I2_LDB, I2_STB, I2_PEEK,
-       I2_PUSHM, I2_POPM, I2_JAL };
+       I2_PUSHM, I2_POPM, I2_JAL, I2_FADD,
+       I2_FSUB, I2_FMUL, I2_FDIV, I2_FCMP,
+       I2_ITOF, I2_FTOI };
 
 /* id selectors (cpuid-like): `id rd, sel` puts the answer for `sel` in rd.
  * Unknown selectors return 0; ID_MAX returns the highest valid selector. */
@@ -64,12 +66,13 @@ enum { FEAT_MEMOPS = 1 << 0,   /* [reg] memory operands on ALU instructions */
        FEAT_EXTALU = 1 << 6,   /* tst/neg/mulh/mulhs/divmod/rol/ror/rcr/bset/bclr/btst */
        FEAT_MEMB   = 1 << 7,   /* ldb/stb byte memory */
        FEAT_STACK2 = 1 << 8,   /* peek/pushm/popm */
-       FEAT_JX     = 1 << 9 }; /* jnc/jal */
+       FEAT_JX     = 1 << 9,   /* jnc/jal */
+       FEAT_FP     = 1 << 10 };/* binary16 float: fadd/fsub/fmul/fdiv/fcmp/itof/ftoi */
 
 enum { PORTF_IO   = 1 << 0,
        PORTF_TIME = 1 << 1 };
 
-#define BOB16_VERSION 0x0102   /* 1.2: extended mode-2 set */
+#define BOB16_VERSION 0x0103   /* 1.3: binary16 floats */
 
 static struct {
     word r[16];
@@ -95,6 +98,72 @@ static void set_cc(word val) {
     cpu.cc[N] = s < 0;
     cpu.cc[Z] = s == 0;
     cpu.cc[P] = s > 0;
+}
+
+/* binary16 (IEEE 754 half) helpers: bit-exact, round-to-nearest-even,
+ * no compiler _Float16 needed. NaN canonicalizes to 0x7E00. */
+static float h2f(word h) {
+    uint32_t s = (uint32_t)(h >> 15) << 31;
+    uint32_t e = (h >> 10) & 0x1F;
+    uint32_t m = h & 0x3FF;
+    uint32_t u;
+    if (e == 31) {
+        u = s | 0x7F800000u | (m ? ((m << 13) | 0x400000u) : 0);
+    } else if (e == 0) {
+        if (m == 0) {
+            u = s;                       /* signed zero */
+        } else {
+            int ee = -14;
+            while (!(m & 0x400)) {
+                m <<= 1;
+                ee--;
+            }
+            m &= 0x3FF;
+            u = s | ((uint32_t)(ee + 127) << 23) | (m << 13);
+        }
+    } else {
+        u = s | ((uint32_t)(e + 112) << 23) | (m << 13);
+    }
+    float f;
+    memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+static int hisnan(word h) {
+    return ((h & 0x7C00) == 0x7C00) && (h & 0x03FF);
+}
+
+static word f2h(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    uint32_t s = (u >> 31) & 1;
+    word h;
+    if ((u & 0x7FFFFFFFu) >= 0x7F800000u) {
+        h = (u & 0x7FFFFFu) ? 0x7E00 : 0x7C00;   /* nan -> canonical, inf */
+    } else {
+        int e = (int)((u >> 23) & 0xFF) - 127;
+        uint32_t m = u & 0x7FFFFFu;
+        if (e >= 16) {
+            h = 0x7C00;                  /* overflow -> inf */
+        } else if (e >= -14) {
+            uint32_t drop = m & 0x1FFFu;
+            h = (word)(((e + 15) << 10) | (m >> 13));
+            if (drop > 0x1000u || (drop == 0x1000u && (h & 1)))
+                h++;                     /* rounds 0x7BFF up to inf */
+        } else if (e >= -24) {
+            uint32_t mm = m | 0x800000u;
+            int sh = -(e + 1);           /* 14..23 */
+            uint32_t span = 1u << sh;
+            uint32_t rem = mm & (span - 1);
+            uint32_t q = mm >> sh;
+            if (rem > (span >> 1) || (rem == (span >> 1) && (q & 1)))
+                q++;
+            h = q >= 1024 ? 0x0400 : (word)q;   /* may become smallest normal */
+        } else {
+            h = 0;                       /* underflow -> zero */
+        }
+    }
+    return (word)((s << 15) | h);
 }
 
 static void bad(word addr) {
@@ -377,6 +446,8 @@ static void step2(void) {
         case I2_MULH: case I2_MULHS: case I2_DIVMOD:
         case I2_ROL: case I2_ROR: case I2_RCR:
         case I2_BSET: case I2_BCLR: case I2_TST: case I2_BTST:
+        case I2_FADD: case I2_FSUB: case I2_FMUL: case I2_FDIV:
+        case I2_FCMP:
             if (i2) bad(at0);        /* i2 and i3 are mutually exclusive */
             break;
         case I2_JMP: case I2_JN: case I2_JZ: case I2_JP:
@@ -402,18 +473,20 @@ static void step2(void) {
         switch (opc) {
         case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
         case I2_XOR: case I2_NOT: case I2_NEG:
+        case I2_ITOF: case I2_FTOI:
         case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
         case I2_MOD: case I2_SDIV: case I2_SMOD:
         case I2_ADC: case I2_SBB:
         case I2_MULH: case I2_MULHS:
         case I2_ROL: case I2_ROR: case I2_RCR:
         case I2_BSET: case I2_BCLR:
+        case I2_FADD: case I2_FSUB: case I2_FMUL: case I2_FDIV:
             if (!imemd && doff != 0) bad(at0);
             break;
         case I2_DIVMOD:
             if (imemd || doff != 0) bad(at0);  /* quot to plain reg only */
             break;
-        case I2_CMP: case I2_TST: case I2_BTST:
+        case I2_CMP: case I2_TST: case I2_BTST: case I2_FCMP:
         case I2_LOAD: case I2_LOAD2: case I2_MOVE: case I2_ID:
         case I2_IN: case I2_PUSH: case I2_CALL:
         case I2_LDB: case I2_PEEK: case I2_JAL:
@@ -446,15 +519,19 @@ static void step2(void) {
     case I2_MULH: case I2_MULHS: case I2_DIVMOD:
     case I2_ROL: case I2_ROR: case I2_RCR:
     case I2_BSET: case I2_BCLR: case I2_TST: case I2_BTST:
+    case I2_FADD: case I2_FSUB: case I2_FMUL: case I2_FDIV:
+    case I2_FCMP: case I2_ITOF: case I2_FTOI:
         break;
     default:
         if (i2 || imemd || imem1 || imem2) bad(at0);
         break;
     }
-    /* o2 is unused by NOT/NEG: reject stray flags there */
-    if ((opc == I2_NOT || opc == I2_NEG) && (i2 || imem2)) bad(at0);
+    /* o2 is unused by NOT/NEG/ITOF/FTOI: reject stray flags there */
+    if ((opc == I2_NOT || opc == I2_NEG ||
+         opc == I2_ITOF || opc == I2_FTOI) && (i2 || imem2)) bad(at0);
     /* CMP family has no destination: reject imemd */
-    if ((opc == I2_CMP || opc == I2_TST || opc == I2_BTST) && imemd) bad(at0);
+    if ((opc == I2_CMP || opc == I2_TST || opc == I2_BTST ||
+         opc == I2_FCMP) && imemd) bad(at0);
     if (i4) cpu.pc++;
 
     switch (opc) {
@@ -686,7 +763,7 @@ static void step2(void) {
         case ID_FEATURES: v = FEAT_MEMOPS | FEAT_IMM16 | FEAT_SDIV |
                               FEAT_IO | FEAT_STACK | FEAT_OFF |
                               FEAT_EXTALU | FEAT_MEMB | FEAT_STACK2 |
-                              FEAT_JX; break;
+                              FEAT_JX | FEAT_FP; break;
         case ID_MEMTOP:   v = (word)(MEM_WORDS - 1); break;
         case ID_RS0:      v = cpu.rs0; break;
         case ID_REGS:     v = (8 << 8) | 16; break;
@@ -971,6 +1048,66 @@ static void step2(void) {
         word ret = cpu.pc;   /* past i3/i4 words */
         cpu.pc = or1v;
         cpu.r[dr] = ret;
+        break;
+    }
+
+    case I2_FADD: {
+        alu_pre;
+        r = f2h(h2f(a) + h2f(b));
+        alu_post;
+        break;
+    }
+
+    case I2_FSUB: {
+        alu_pre;
+        r = f2h(h2f(a) - h2f(b));
+        alu_post;
+        break;
+    }
+
+    case I2_FMUL: {
+        alu_pre;
+        r = f2h(h2f(a) * h2f(b));
+        alu_post;
+        break;
+    }
+
+    case I2_FDIV: {   /* IEEE: no trap; x/0 = Inf, 0/0 = NaN */
+        alu_pre;
+        r = f2h(h2f(a) / h2f(b));
+        alu_post;
+        break;
+    }
+
+    case I2_FCMP: {   /* NaN clears all flags (unordered) */
+        alu_src;
+        if (hisnan(a) || hisnan(b)) {
+            cpu.cc[N] = cpu.cc[Z] = cpu.cc[P] = false;
+        } else {
+            float fa = h2f(a), fb = h2f(b);
+            cpu.cc[N] = fa < fb;
+            cpu.cc[Z] = fa == fb;
+            cpu.cc[P] = fa > fb;
+        }
+        break;
+    }
+
+    case I2_ITOF: {   /* signed int16 -> binary16 */
+        alu_pre;
+        r = f2h((float)(int16_t)a);
+        alu_post;
+        break;
+    }
+
+    case I2_FTOI: {   /* binary16 -> signed int16, truncates; traps out of range */
+        alu_pre;
+        if (hisnan(a)) bad(at0);
+        {
+            float f = h2f(a);
+            if (f > 32767.0f || f < -32768.0f) bad(at0);
+            r = (word)(int16_t)f;
+        }
+        alu_post;
         break;
     }
 
