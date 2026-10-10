@@ -55,15 +55,20 @@ MODE 2 (32-bit instructions, entered with `trap ext` with r7 = code address;
   add sub mul and or xor shl shr sar div mod sdiv smod adc sbb   rd, rs1, rs2|imm
         (imm 0..15 uses the short form; anything else, negatives and forward
          label references included, uses a 16-bit immediate: add r1, r1, -1)
-  not rd, rs      swap rd, rs     pop rd, rsp     ret rsp
+  neg rd, rs         not rd, rs      swap rd, rs     pop rd, rsp     ret rsp
+  mulh mulhs divmod rol ror rcr bset bclr   rd, rs1, rs2|imm
+        (divmod rq, rn, rd: rq = rn/rd, rn = rn%rd)
+  ldb rd, raddr|imm  stb raddr, rval|imm
+        (byte addresses: word = addr>>1, even = low byte)
+  peek rd, rsp|imm   pushm rsp, mask   popm rsp, mask   jal rd, rtarget|imm
   move rd, rs|imm       load rd, raddr|imm     load2 rd, raddr|imm
   stor raddr, rval|imm  stor2 raddr, rval|imm
   in rd, rport|imm      out rport, rval|imm    id rd, rsel|imm
   push rsp, rval|imm    call rsp, rtarget|imm
   (id selectors ID_MAX ID_VERSION ID_FEATURES ID_MEMTOP ID_RS0 ID_REGS ID_OPCODES
-   ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK/OFF are predefined)
-  cmp rs1, rs2|imm
-  jmp jn jz jp jnz jle jge jc  rtarget|addr          (jmp loop)
+   ID_PORTS ID_NAME0..2 and bit masks FEAT_MEMOPS/IMM16/SDIV/IO/STACK/OFF/EXTALU/MEMB/STACK2/JX are predefined)
+  cmp rs1, rs2|imm   tst rs1, rs2|imm   btst rs1, bit
+  jmp jn jz jp jnz jle jge jc jnc  rtarget|addr          (jmp loop)
   Memory operands: add sub mul and or xor shl shr sar div mod sdiv smod cmp adc sbb
   accept [reg] for any operand: [rs1]/[rs2] read mem[reg] instead of reg, and a
   bracketed destination [rd] stores the result to mem[rd], e.g.
@@ -424,10 +429,16 @@ M2 = {
     'div': (30, 'rrx'), 'mod': (31, 'rrx'), 'cmp': (32, 'cmp'),
     'jnz': (33, 'j'), 'jle': (34, 'j'), 'jge': (35, 'j'),
     'sdiv': (36, 'rrx'), 'smod': (37, 'rrx'), 'adc': (38, 'rrx'),
-    'sbb': (39, 'rrx'), 'jc': (40, 'j')
+    'sbb': (39, 'rrx'), 'jc': (40, 'j'),
+    'tst': (41, 'cmp'), 'jnc': (42, 'j'), 'neg': (43, 'rr'),
+    'mulh': (44, 'rrx'), 'mulhs': (45, 'rrx'), 'divmod': (46, 'rrx'),
+    'rol': (47, 'rrx'), 'ror': (48, 'rrx'), 'rcr': (49, 'rrx'),
+    'bset': (50, 'rrx'), 'bclr': (51, 'rrx'), 'btst': (52, 'cmp'),
+    'ldb': (53, 'rs'), 'stb': (54, 'rs'), 'peek': (55, 'rs'),
+    'pushm': (56, 'rs'), 'popm': (57, 'rs'), 'jal': (58, 'rs')
 }
 M2_ALIAS = {'mov': 'move', 'li': 'move'}
-M2_MACROS = {'inc', 'dec', 'neg', 'clr', 'tst'}
+M2_MACROS = {'inc', 'dec', 'clr'}
 
 
 # ALU instructions accept [reg] memory operands: [dst] -> bit 5, [src1] -> bit 4,
@@ -478,7 +489,7 @@ def enc2(env, mn, ops, cc):
     if shape == 'rrx' and len(ops) == 2:        # `add rd, x`  ==  `add rd, rd, x`
         ops = [ops[0], ops[0], ops[1]]
 
-    roles = MEM_ROLES.get(shape, 'd1' if mn == 'not' else '')
+    roles = MEM_ROLES.get(shape, 'd1' if mn in ('not', 'neg') else '')
     bases, mems = [], []
     for i, o in enumerate(ops):
         t = o.strip()
@@ -545,6 +556,8 @@ def enc2(env, mn, ops, cc):
             else:
                 imm16(ops[0])
     elif shape == 'rr':
+        if mn == 'neg' and len(ops) == 1:    # legacy `neg rd` == `neg rd, rd`
+            ops = [ops[0], ops[0]]
         need(mn, ops, 2)
         if mn == 'swap':                      # both sides take offsets
             ro0 = split_reg_off(ops[0], 15, env)
@@ -563,7 +576,7 @@ def enc2(env, mn, ops, cc):
                 set_soff(ro[1])
             else:
                 o1 = R(ops[1])
-        else:                                 # not: `not rd, rs+off`, `[rd+off]`
+        else:                                 # not/neg: `not rd, rs+off`, `[rd+off]`
             if mems[0]:
                 ro = split_reg_off(ops[0], 15, env)
                 if ro is not None:
@@ -581,28 +594,42 @@ def enc2(env, mn, ops, cc):
                 o1 = R(ops[1])
     elif shape == 'rs':                     # second operand: register or 16-bit immediate
         need(mn, ops, 2)
-        if mn in ('stor', 'stor2', 'out'):
-            ro = split_reg_off(ops[0], 15, env)   # address/port offset (high)
-            if ro is not None:
-                dr = ro[0]
-                set_doff(ro[1])
-            else:
-                dr = R(ops[0])
-        else:                                 # dest is a plain register
-            dr = no_off(ops[0], "destination")
-        ro = split_reg_off(ops[1], 15, env)       # value/port/target offset (low)
-        if ro is not None:
-            o1 = ro[0]
-            set_soff(ro[1])
-        else:
+        if mn in ('pushm', 'popm'):           # mask: no offsets either side
+            dr = no_off(ops[0], "stack pointer")
+            if split_reg_off(ops[1], 15, env) is not None:
+                raise AsmError("offsets not allowed on the mask")
             r = as_reg(ops[1], 15)
             if r is not None:
                 o1 = r
             else:
                 imm16(ops[1])
+        else:
+            if mn in ('stor', 'stor2', 'stb', 'out'):
+                ro = split_reg_off(ops[0], 15, env)   # address/port offset (high)
+                if ro is not None:
+                    dr = ro[0]
+                    set_doff(ro[1])
+                else:
+                    dr = R(ops[0])
+            else:                                 # dest is a plain register
+                dr = no_off(ops[0], "destination")
+            ro = split_reg_off(ops[1], 15, env)   # value/port/target offset (low)
+            if ro is not None:
+                o1 = ro[0]
+                set_soff(ro[1])
+            else:
+                r = as_reg(ops[1], 15)
+                if r is not None:
+                    o1 = r
+                else:
+                    imm16(ops[1])
     elif shape == 'rrx':
         need(mn, ops, 3)
-        if mems[0]:                           # `[rd+off]` destination offset
+        if mn == 'divmod':                     # quot to plain reg only (rem -> or1)
+            if mems[0]:
+                raise AsmError("'divmod' quotient goes to a plain register")
+            dr = no_off(ops[0], "destination")
+        elif mems[0]:                         # `[rd+off]` destination offset
             ro = split_reg_off(ops[0], 15, env)
             if ro is not None:
                 dr = ro[0]
@@ -621,6 +648,8 @@ def enc2(env, mn, ops, cc):
             raise AsmError("offsets not allowed on the third operand")
         o2 = reg_or_imm(ops[2])
     elif shape == 'cmp':
+        if mn == 'tst' and len(ops) == 1:    # legacy `tst rd` == `tst rd, 0`
+            ops = [ops[0], '0']
         need(mn, ops, 2)
         ro = split_reg_off(ops[0], 15, env)
         if ro is not None:
@@ -647,24 +676,15 @@ def enc2(env, mn, ops, cc):
 
 def macro2(env, mn, ops, cc):
     """Mode-2 macros.  `.cc` applies to the instruction that produces the result.
-    Bracketed [reg] memory operands work too: inc [r1], neg [r2], clr [r3]."""
+    Bracketed [reg] memory operands work too: inc [r1], clr [r3]."""
     if mn in ('inc', 'dec'):                    # inc rd | inc rd, rs
         if len(ops) not in (1, 2):
             raise AsmError("'%s' takes 1 or 2 operands" % mn)
         src = ops[1] if len(ops) == 2 else ops[0]
         return enc2(env, 'add' if mn == 'inc' else 'sub', [ops[0], src, '1'], cc)
-    if mn == 'neg':                             # neg rd | neg rd, rs   (not; add 1)
-        if len(ops) not in (1, 2):
-            raise AsmError("'neg' takes 1 or 2 operands")
-        src = ops[1] if len(ops) == 2 else ops[0]
-        return (enc2(env, 'not', [ops[0], src], False) +
-                enc2(env, 'add', [ops[0], ops[0], '1'], cc))
     if mn == 'clr':                             # clr rd  (rd = rd ^ rd)
         need(mn, ops, 1)
         return enc2(env, 'xor', [ops[0]] * 3, cc)
-    if mn == 'tst':                             # tst rd  (cmp rd, 0)
-        need(mn, ops, 1)
-        return enc2(env, 'cmp', [ops[0], '0'], False)
     raise AsmError("internal: unhandled mode-2 macro '%s'" % mn)
 
 
@@ -914,7 +934,8 @@ BUILTINS = {
     'ID_REGS': 5, 'ID_OPCODES': 6, 'ID_PORTS': 7,
     'ID_NAME0': 8, 'ID_NAME1': 9, 'ID_NAME2': 10,
     'FEAT_MEMOPS': 1, 'FEAT_IMM16': 2, 'FEAT_SDIV': 4, 'FEAT_IO': 8, 'FEAT_STACK': 16,
-    'FEAT_OFF': 32,
+    'FEAT_OFF': 32, 'FEAT_EXTALU': 64, 'FEAT_MEMB': 128, 'FEAT_STACK2': 256,
+    'FEAT_JX': 512,
 }
 
 

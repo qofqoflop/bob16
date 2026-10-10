@@ -35,7 +35,11 @@ enum { I2_NOP, I2_HALT, I2_UEXT, I2_ADD,
        I2_SHR, I2_SAR, I2_DIV, I2_MOD,
        I2_CMP, I2_JNZ, I2_JLE, I2_JGE,
        I2_SDIV, I2_SMOD, I2_ADC, I2_SBB,
-       I2_JC };
+       I2_JC, I2_TST, I2_JNC, I2_NEG,
+       I2_MULH, I2_MULHS, I2_DIVMOD, I2_ROL,
+       I2_ROR, I2_RCR, I2_BSET, I2_BCLR,
+       I2_BTST, I2_LDB, I2_STB, I2_PEEK,
+       I2_PUSHM, I2_POPM, I2_JAL };
 
 /* id selectors (cpuid-like): `id rd, sel` puts the answer for `sel` in rd.
  * Unknown selectors return 0; ID_MAX returns the highest valid selector. */
@@ -56,12 +60,16 @@ enum { FEAT_MEMOPS = 1 << 0,   /* [reg] memory operands on ALU instructions */
        FEAT_SDIV   = 1 << 2,   /* signed sdiv / smod */
        FEAT_IO     = 1 << 3,   /* in / out */
        FEAT_STACK  = 1 << 4,   /* push / pop / call / ret */
-       FEAT_OFF    = 1 << 5 }; /* i4/i5: 8-bit offsets on ALU src/dst */
+       FEAT_OFF    = 1 << 5,   /* i4/i5: 8-bit offsets on src/dst */
+       FEAT_EXTALU = 1 << 6,   /* tst/neg/mulh/mulhs/divmod/rol/ror/rcr/bset/bclr/btst */
+       FEAT_MEMB   = 1 << 7,   /* ldb/stb byte memory */
+       FEAT_STACK2 = 1 << 8,   /* peek/pushm/popm */
+       FEAT_JX     = 1 << 9 }; /* jnc/jal */
 
 enum { PORTF_IO   = 1 << 0,
        PORTF_TIME = 1 << 1 };
 
-#define BOB16_VERSION 0x0101   /* 1.1: i4/i5 offsets */
+#define BOB16_VERSION 0x0102   /* 1.2: extended mode-2 set */
 
 static struct {
     word r[16];
@@ -358,6 +366,7 @@ static void step2(void) {
     int64_t timet;
 
     cpu.ir = mem[at0];
+    if ((mem[at1] & 0xF) != 0) bad(at0);  /* second-word low nibble reserved */
     if (i3) {
         /* i3 = third word holds a 16-bit immediate; only some ops take it */
         switch (opc) {
@@ -365,15 +374,20 @@ static void step2(void) {
         case I2_XOR: case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
         case I2_MOD: case I2_CMP: case I2_SDIV: case I2_SMOD:
         case I2_ADC: case I2_SBB:
+        case I2_MULH: case I2_MULHS: case I2_DIVMOD:
+        case I2_ROL: case I2_ROR: case I2_RCR:
+        case I2_BSET: case I2_BCLR: case I2_TST: case I2_BTST:
             if (i2) bad(at0);        /* i2 and i3 are mutually exclusive */
             break;
         case I2_JMP: case I2_JN: case I2_JZ: case I2_JP:
         case I2_JNZ: case I2_JLE: case I2_JGE:
-        case I2_UEXT: case I2_JC:
+        case I2_UEXT: case I2_JC: case I2_JNC:
         /* target replaces r[dr] */
         case I2_LOAD: case I2_LOAD2: case I2_STOR: case I2_STOR2:
         case I2_IN: case I2_OUT: case I2_PUSH: case I2_MOVE:
         case I2_CALL: case I2_ID:
+        case I2_LDB: case I2_STB: case I2_PEEK:
+        case I2_PUSHM: case I2_POPM: case I2_JAL:
         /* immediate replaces r[or1] */
             break;
         default:
@@ -387,26 +401,36 @@ static void step2(void) {
          * Unused half must be zero so silent ignores trap. */
         switch (opc) {
         case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
-        case I2_XOR: case I2_NOT:
+        case I2_XOR: case I2_NOT: case I2_NEG:
         case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
         case I2_MOD: case I2_SDIV: case I2_SMOD:
         case I2_ADC: case I2_SBB:
+        case I2_MULH: case I2_MULHS:
+        case I2_ROL: case I2_ROR: case I2_RCR:
+        case I2_BSET: case I2_BCLR:
             if (!imemd && doff != 0) bad(at0);
             break;
-        case I2_CMP:
+        case I2_DIVMOD:
+            if (imemd || doff != 0) bad(at0);  /* quot to plain reg only */
+            break;
+        case I2_CMP: case I2_TST: case I2_BTST:
         case I2_LOAD: case I2_LOAD2: case I2_MOVE: case I2_ID:
         case I2_IN: case I2_PUSH: case I2_CALL:
+        case I2_LDB: case I2_PEEK: case I2_JAL:
             if (doff != 0) bad(at0);
             break;
-        case I2_STOR: case I2_STOR2: case I2_OUT: case I2_SWAP:
+        case I2_STOR: case I2_STOR2: case I2_STB: case I2_OUT: case I2_SWAP:
             break;                  /* both halves used */
         case I2_JMP: case I2_JN: case I2_JZ: case I2_JP:
-        case I2_JNZ: case I2_JLE: case I2_JGE: case I2_JC:
+        case I2_JNZ: case I2_JLE: case I2_JGE: case I2_JC: case I2_JNC:
         case I2_UEXT: case I2_RET:
             if (soff != 0) bad(at0);
             break;
         case I2_POP:
             if (doff != 0) bad(at0);
+            break;
+        case I2_PUSHM: case I2_POPM:
+            if (soff != 0 || doff != 0) bad(at0);
             break;
         default:                    /* NOP, HALT */
             bad(at0);
@@ -415,15 +439,22 @@ static void step2(void) {
     /* non-ALU ops must not carry ALU-only mem/i2 flags */
     switch (opc) {
     case I2_ADD: case I2_SUB: case I2_MUL: case I2_AND: case I2_OR:
-    case I2_XOR: case I2_NOT:
+    case I2_XOR: case I2_NOT: case I2_NEG:
     case I2_SHL: case I2_SHR: case I2_SAR: case I2_DIV:
     case I2_MOD: case I2_CMP: case I2_SDIV: case I2_SMOD:
     case I2_ADC: case I2_SBB:
+    case I2_MULH: case I2_MULHS: case I2_DIVMOD:
+    case I2_ROL: case I2_ROR: case I2_RCR:
+    case I2_BSET: case I2_BCLR: case I2_TST: case I2_BTST:
         break;
     default:
         if (i2 || imemd || imem1 || imem2) bad(at0);
         break;
     }
+    /* o2 is unused by NOT/NEG: reject stray flags there */
+    if ((opc == I2_NOT || opc == I2_NEG) && (i2 || imem2)) bad(at0);
+    /* CMP family has no destination: reject imemd */
+    if ((opc == I2_CMP || opc == I2_TST || opc == I2_BTST) && imemd) bad(at0);
     if (i4) cpu.pc++;
 
     switch (opc) {
@@ -482,6 +513,14 @@ static void step2(void) {
     case I2_NOT: {
         alu_pre;
         r = ~a;
+        alu_post;
+        break;
+    }
+
+    case I2_NEG: {   /* rd = -rs */
+        alu_pre;
+        r = (word)(0u - a);
+        if (icc) cpu.cc[C] = (a != 0);   /* borrow out */
         alu_post;
         break;
     }
@@ -645,11 +684,13 @@ static void step2(void) {
         case ID_MAX:      v = ID_NAME2; break;
         case ID_VERSION:  v = BOB16_VERSION; break;
         case ID_FEATURES: v = FEAT_MEMOPS | FEAT_IMM16 | FEAT_SDIV |
-                              FEAT_IO | FEAT_STACK | FEAT_OFF; break;
+                              FEAT_IO | FEAT_STACK | FEAT_OFF |
+                              FEAT_EXTALU | FEAT_MEMB | FEAT_STACK2 |
+                              FEAT_JX; break;
         case ID_MEMTOP:   v = (word)(MEM_WORDS - 1); break;
         case ID_RS0:      v = cpu.rs0; break;
         case ID_REGS:     v = (8 << 8) | 16; break;
-        case ID_OPCODES:  v = I2_JC + 1; break;
+        case ID_OPCODES:  v = I2_JAL + 1; break;
         case ID_PORTS:    v = PORTF_IO | PORTF_TIME; break;
         case ID_NAME0:    v = ('B' << 8) | 'O'; break;
         case ID_NAME1:    v = ('B' << 8) | '-'; break;
@@ -711,6 +752,30 @@ static void step2(void) {
         break;
     }
 
+    case I2_TST: {   /* and without write, flags only */
+        alu_src;
+        {
+            word t = (word)(a & b);
+            cpu.cc[N] = ((int16_t)t) < 0;
+            cpu.cc[Z] = t == 0;
+            cpu.cc[P] = ((int16_t)t) > 0;
+        }
+        break;
+    }
+
+    case I2_BTST: {   /* C = tested bit; N/Z/P from masked result */
+        alu_src;
+        {
+            unsigned bit = b & 15;
+            word t = (word)(a & ((word)1u << bit));
+            cpu.cc[C] = (a >> bit) & 1u;
+            cpu.cc[N] = ((int16_t)t) < 0;
+            cpu.cc[Z] = t == 0;
+            cpu.cc[P] = ((int16_t)t) > 0;
+        }
+        break;
+    }
+
     case I2_JNZ: {
         if (cpu.cc[N] || cpu.cc[P]) cpu.pc = jmpv;
         break;
@@ -766,6 +831,146 @@ static void step2(void) {
 
     case I2_JC: {
         if (cpu.cc[C]) cpu.pc = jmpv;
+        break;
+    }
+
+    case I2_JNC: {
+        if (!cpu.cc[C]) cpu.pc = jmpv;
+        break;
+    }
+
+    case I2_MULH: {   /* upper 16 of unsigned product */
+        alu_pre;
+        r = (word)(((uint32_t)a * b) >> 16);
+        alu_post;
+        break;
+    }
+
+    case I2_MULHS: {   /* upper 16 of signed product */
+        alu_pre;
+        r = (word)(((int32_t)(int16_t)a * (int16_t)b) >> 16);
+        alu_post;
+        break;
+    }
+
+    case I2_DIVMOD: {   /* quot -> rd, rem -> or1 (in-out) */
+        alu_pre;
+        if (b == 0) {
+            bad(at0);
+        }
+        {
+            word abase = cpu.r[or1];
+            if (i4) {
+                if (i5) abase -= soff;
+                else abase += soff;
+            }
+            word m = (word)(a % b);
+            r = (word)(a / b);
+            if (imem1) mem[abase] = m;
+            else cpu.r[or1] = m;
+        }
+        if (icc) set_cc(r);
+        cpu.r[dr] = r;   /* validated: plain reg dest only */
+        break;
+    }
+
+    case I2_ROL: {
+        alu_pre;
+        {
+            unsigned n = b & 15;
+            r = n ? (word)((a << n) | (a >> (16 - n))) : a;
+        }
+        alu_post;
+        break;
+    }
+
+    case I2_ROR: {
+        alu_pre;
+        {
+            unsigned n = b & 15;
+            r = n ? (word)((a >> n) | (a << (16 - n))) : a;
+        }
+        alu_post;
+        break;
+    }
+
+    case I2_RCR: {   /* rotate right through carry; C in, C out iff icc */
+        alu_pre;
+        {
+            unsigned n = b % 17;
+            word cout = cpu.cc[C];
+            if (n != 0) {
+                uint32_t v = ((uint32_t)cpu.cc[C] << 16) | a;
+                v = ((v >> n) | (v << (17 - n))) & 0x1FFFFu;
+                r = (word)(v & 0xFFFFu);
+                cout = (word)((v >> 16) & 1u);
+            } else {
+                r = a;
+            }
+            if (icc) cpu.cc[C] = cout;
+        }
+        alu_post;
+        break;
+    }
+
+    case I2_BSET: {
+        alu_pre;
+        r = (word)(a | ((word)1u << (b & 15)));
+        alu_post;
+        break;
+    }
+
+    case I2_BCLR: {
+        alu_pre;
+        r = (word)(a & ~((word)1u << (b & 15)));
+        alu_post;
+        break;
+    }
+
+    case I2_LDB: {   /* zero-extending byte load; word = addr>>1 */
+        word addr = or1v;
+        word wd = mem[addr >> 1];
+        cpu.r[dr] = (addr & 1) ? ((wd >> 8) & 0xFF) : (wd & 0xFF);
+        if (icc) set_cc(cpu.r[dr]);
+        break;
+    }
+
+    case I2_STB: {   /* byte store, preserves the other half */
+        word addr = droff;
+        word v = or1v & 0xFF;
+        word wd = mem[addr >> 1];
+        mem[addr >> 1] = (addr & 1) ? (word)((wd & 0xFF) | (v << 8))
+                                    : (word)((wd & 0xFF00) | v);
+        if (icc) set_cc(or1v);
+        break;
+    }
+
+    case I2_PEEK: {   /* non-destructive top-of-stack read */
+        cpu.r[dr] = mem[(word)(or1v + 1)];
+        if (icc) set_cc(cpu.r[dr]);
+        break;
+    }
+
+    case I2_PUSHM: {   /* push every reg in mask, ascending */
+        word mask = or1v;
+        for (int n = 0; n < 16; n++) {
+            if ((mask >> n) & 1u) mem[cpu.r[dr]--] = cpu.r[n];
+        }
+        break;
+    }
+
+    case I2_POPM: {   /* pop every reg in mask, descending */
+        word mask = or1v;
+        for (int n = 15; n >= 0; n--) {
+            if ((mask >> n) & 1u) cpu.r[n] = mem[++cpu.r[dr]];
+        }
+        break;
+    }
+
+    case I2_JAL: {   /* link in register (vs CALL to stack) */
+        word ret = cpu.pc;   /* past i3/i4 words */
+        cpu.pc = or1v;
+        cpu.r[dr] = ret;
         break;
     }
 
