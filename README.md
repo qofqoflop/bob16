@@ -12,6 +12,9 @@ instruction set. Version 1.2, 59 mode-2 opcodes.
 * Dual instruction set, selected by `rs0` bit 0. The CPU boots in mode 1.
   `trap ext` / `enter2 label` (with `r7` = target) enters mode 2;
   `uext` leaves it.
+* Memory map: user code+data in `0x0000..0x7FFF`; `0x8000..0xFFFF` is
+  reserved for libc's own use (stack grows down from `0xFFFF`, plus future
+  heap and libc statics). Enforced at build time, not hardware.
 * Condition flags N/Z/P plus carry/borrow C (`adc`/`sbb`/`neg`/`rcr`,
   `jc`/`jnc`, `r1 = r1 + r2 + C` style extended arithmetic).
 * `id rd, sel` introspection (cpuid-like): version, `FEAT_*` bit mask,
@@ -61,7 +64,7 @@ Append `.cc` to update the condition codes, e.g. `add.cc`.
 ## Assembler
 
 ```
-bob16asm.py prog.asm [-o prog.bin] [-l prog.lst] [--big-endian]
+bob16asm.py prog.asm [-o prog.bin] [-l prog.lst] [--big-endian] [--limit 0x8000]
 ```
 
 Two passes with labels, `+ - * / % << >> & | ^ ~ ( )` expressions, `$`
@@ -71,6 +74,40 @@ directives `.org .mode .word .string/.asciz/.ascii .fill/.space/.blkw
 .equ` (also `NAME = expr`). `ID_*` selectors and `FEAT_*` mask bits are
 predefined. Mode-1 and mode-2 instructions are cross-checked
 (`.mode 1|2` switches).
+
+`--limit` caps the top of user memory (exclusive); use `0x8000` to keep
+programs out of the libc-reserved upper half. `bobc` programs build with it:
+`bobc.py p.b -o p.asm && bob16asm.py p.asm --limit 0x8000`.
+
+
+## Compiler (`bobc`)
+
+`bobc.py` compiles a C-like subset (`int`/`unsigned`/`char`/`half`/`void`, globals,
+functions with params/calls/recursion, arrays + pointers, `if`/`while`/
+`do`/`for`/`return`/`break`/`continue`, full C expression precedence,
+`puts`/`putc`/`print_int`; see `example/hello.b`, `example/fib.b`,
+`example/funcs.b`, `example/half.b`, `example/uselib.b` + `example/mathlib.b`).
+Args go right-to-left on the stack
+(`r10` = SP, `r11` = FP, result in `r0`, caller cleans up). `half` is IEEE
+binary16 (`1.5h` literals, `fdiv` never traps, `ftoi` traps out of range /
+on NaN, NaN comparisons are all false except `!=`). Structs (`struct P {
+... };`, `p.x` / `p->x`, struct assignment copies; params/returns must be
+pointers) and enums (`enum C { RED, GREEN = 5 };` → int constants) round
+out the type system; see `example/structs.b`. Methods (`void P.move(int dx)
+{ this->x += dx; }`, called as `p.move(1, 2)` / `q->move(1, 2)` with `this`
+as a `P *`) and unions (`union W { int i; half h; };`, all members at
+offset 0, size = max) complete aggregates; see `example/methods.b`.
+Templates (`template <typename T> T max(T a, T b) {...}`, used as
+`max<int>(3, 4)`; also `struct`/`union` templates like
+`struct Box<T> { T val; };`) monomorphize at parse time, so each instance
+is an ordinary function/struct afterwards; see `example/templates.b`.
+Explicit type arguments are required (no deduction yet), as is
+definition-before-use.
+Defer (`defer f(x);` or `defer { ... }`) runs code when the enclosing
+scope ends, LIFO — including `return`/`break`/`continue` and each loop
+iteration; loop bodies and branch blocks are scopes. Deferred code is
+late-bound (it reads variables as they are when it runs) and shares the
+function frame; `return` is banned inside it. See `example/defer.b`.
 
 ## Converter
 

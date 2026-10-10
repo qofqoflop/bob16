@@ -173,9 +173,10 @@ def _char_sub(m):
 
 
 class Env:
-    def __init__(self, syms, final):
+    def __init__(self, syms, final, limit=0x10000):
         self.syms = syms
         self.final = final
+        self.limit = limit
         self.pc = 0
         self.mode = 1
         self.item = None      # line being assembled (remembers its i3 decision)
@@ -949,8 +950,8 @@ def directive(env, it):
     if d == '.org':
         need(d, ops, 1)
         a = eval_expr(ops[0], env, strict=True)
-        if not 0 <= a <= 0xFFFF:
-            raise AsmError(".org address out of range")
+        if not 0 <= a < env.limit:
+            raise AsmError(".org address out of range (limit 0x%04X)" % env.limit)
         env.pc = a
         return []
     if d in ('.mode', '.mode1', '.mode2'):
@@ -1027,8 +1028,8 @@ def process(env, it):
     raise AsmError("unknown instruction '%s'" % mn)
 
 
-def run_pass(items, syms, final, errors, mem=None, listing=None):
-    env = Env(syms, final)
+def run_pass(items, syms, final, errors, mem=None, listing=None, limit=0x10000):
+    env = Env(syms, final, limit)
     for it in items:
         try:
             nonemit = it.mn in ('.org', '.mode', '.mode1', '.mode2')
@@ -1043,8 +1044,8 @@ def run_pass(items, syms, final, errors, mem=None, listing=None):
             if it.mn is not None and not nonemit:
                 words = process(env, it)
             if final and words:
-                if env.pc + len(words) > 0x10000:
-                    raise AsmError("program does not fit in 64K words")
+                if env.pc + len(words) > env.limit:
+                    raise AsmError("program exceeds limit 0x%04X" % env.limit)
                 for i, w in enumerate(words):
                     if env.pc + i in mem:
                         raise AsmError("address 0x%04X is already occupied (overlap)" % (env.pc + i))
@@ -1069,13 +1070,13 @@ BUILTINS = {
 }
 
 
-def assemble(text):
+def assemble(text, limit=0x10000):
     errors, syms, mem, listing = [], dict(BUILTINS), {}, []
     items = parse_source(text, errors)
-    run_pass(items, syms, False, errors)
+    run_pass(items, syms, False, errors, limit=limit)
     if errors:
         return None, None, errors
-    run_pass(items, syms, True, errors, mem, listing)
+    run_pass(items, syms, True, errors, mem, listing, limit=limit)
     if errors:
         return None, None, errors
     return mem, listing, errors
@@ -1087,6 +1088,9 @@ def main():
     ap.add_argument("-o", "--output", help="output .bin (default: source with .bin)")
     ap.add_argument("-l", "--listing", help="write a listing file")
     ap.add_argument("--big-endian", action="store_true", help="emit big-endian words")
+    ap.add_argument("--limit", default="0x10000",
+                    help="user memory top, exclusive (default 0x10000); " +
+                         "use 0x8000 to reserve upper half for libc")
     a = ap.parse_args()
 
     try:
@@ -1095,7 +1099,13 @@ def main():
     except OSError as e:
         sys.exit("bob16asm: %s" % e)
 
-    mem, listing, errors = assemble(text)
+    try:
+        limit = int(a.limit, 0)
+    except ValueError:
+        sys.exit("bob16asm: bad --limit '%s'" % a.limit)
+    if not 1 <= limit <= 0x10000:
+        sys.exit("bob16asm: --limit out of range (1..0x10000)")
+    mem, listing, errors = assemble(text, limit)
     if errors:
         for no, msg in sorted(errors):
             print("%s:%d: error: %s" % (a.source, no, msg), file=sys.stderr)
